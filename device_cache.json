@@ -1,0 +1,193 @@
+{
+  "devices": [
+    {
+      "id": 0,
+      "name": "[Microphone] Microsoft Sound Mapper - Input",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 1,
+      "name": "[Microphone] Microphone (Logi C615 HD WebCam",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 2,
+      "name": "[Microphone] Microphone (Steam Streaming Mic",
+      "channels": 8,
+      "type": "input"
+    },
+    {
+      "id": 3,
+      "name": "[Microphone] Mic/Inst (Samson G-Track Pro)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 4,
+      "name": "[Microphone] Stereo Mix (Realtek(R) Audio)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 10,
+      "name": "[Microphone] Primary Sound Capture Driver",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 11,
+      "name": "[Microphone] Microphone (Logi C615 HD WebCam)",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 12,
+      "name": "[Microphone] Microphone (Steam Streaming Microphone)",
+      "channels": 8,
+      "type": "input"
+    },
+    {
+      "id": 13,
+      "name": "[Microphone] Mic/Inst (Samson G-Track Pro)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 14,
+      "name": "[Microphone] Stereo Mix (Realtek(R) Audio)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 24,
+      "name": "[Microphone] Microphone (Steam Streaming Microphone)",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 25,
+      "name": "[Microphone] Mic/Inst (Samson G-Track Pro)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 26,
+      "name": "[Microphone] Microphone (Logi C615 HD WebCam)",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 27,
+      "name": "[Microphone] Stereo Mix (Realtek(R) Audio)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 29,
+      "name": "[Microphone] Line In (Realtek HD Audio Line input)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 32,
+      "name": "[Microphone] Stereo Mix (Realtek HD Audio Stereo input)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 33,
+      "name": "[Microphone] Microphone (Realtek HD Audio Mic input)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 36,
+      "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(soundcore Liberty 4 NC))",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 39,
+      "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(I53))",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 40,
+      "name": "[Microphone] Microphone (Steam Streaming Microphone Wave)",
+      "channels": 8,
+      "type": "input"
+    },
+    {
+      "id": 43,
+      "name": "[Microphone] Input (@System32\\drivers\\bthhfenum.sys,#4;%1 Hands-Free HF Audio%0\r\n;(Phillip's S23 Ultra))",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 46,
+      "name": "[Microphone] Input (Steam Streaming Speakers Wave)",
+      "channels": 8,
+      "type": "input"
+    },
+    {
+      "id": 51,
+      "name": "[Microphone] Mic/Inst (Samson G-Track Pro)",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 52,
+      "name": "[Microphone] Line ()",
+      "channels": 2,
+      "type": "input"
+    },
+    {
+      "id": 54,
+      "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(Indy Evo))",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 57,
+      "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(Crusher Evo))",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 58,
+      "name": "[Microphone] Microphone (Logi C615 HD WebCam)",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 60,
+      "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(Hesh Evo))",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 62,
+      "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(Soundcore Life Dot 2 NC))",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 64,
+      "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(T18))",
+      "channels": 1,
+      "type": "input"
+    },
+    {
+      "id": 27,
+      "name": "[Speaker Output] Stereo Mix (Realtek(R) Audio) (try this for loopback)",
+      "channels": 2,
+      "type": "possible_loopback"
+    }
+  ],
+  "selected_device_id": 4,
+  "selected_device_type": "input",
+  "selected_device_name": "[Microphone] Stereo Mix (Realtek(R) Audio)"
+}

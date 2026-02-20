@@ -1,0 +1,9 @@
+{
+  "ollamaEndpoint": "http://127.0.0.1:11434",
+  "ollamaModel": "gemma3:4b",
+  "volumeThreshold": 0.0001,
+  "bufferDuration": 3.0,
+  "transcriptionLanguage": "auto",
+  "maxTextLength": 1000,
+  "updateIntervalMs": 100
+}

@@ -1,0 +1,11 @@
+# Audio capture
+sounddevice>=0.4.6
+numpy>=1.24.0
+soundfile>=0.12.0
+
+# SenseVoice transcription
+modelscope>=1.9.0
+funasr>=1.0.0
+
+# Ollama API
+requests>=2.31.0
