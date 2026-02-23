@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Language Learning Assistant</title>
+    <title>LinguaCoda Language Learning Suite</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,7 +11,7 @@
         <!-- Title Bar -->
         <div class="title-bar">
             <div class="title-bar-drag-region">
-                <span class="app-title">Language Learning Assistant</span>
+                <span class="app-title">LinguaCoda Language Learning Suite</span>
             </div>
             <div class="title-bar-controls">
                 <button class="title-bar-button" id="minimize-btn" title="Minimize">
@@ -32,10 +32,24 @@
             </div>
         </div>
 
-        <!-- Main Content -->
-        <div class="main-content">
-            <!-- Control Panel -->
-            <div class="control-panel">
+        <!-- Menu View -->
+        <div id="menu-view" class="view-container menu-view">
+            <div class="menu-content">
+                <h1 class="menu-title">LinguaCoda Language Learning Suite</h1>
+                <div class="menu-buttons">
+                    <button id="subtitles-translation-btn" class="menu-button">
+                        <span class="menu-button-text">Subtitles and Translation</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Transcription/Translation View -->
+        <div id="transcription-view" class="view-container transcription-view" style="display: none;">
+            <!-- Main Content -->
+            <div class="main-content">
+                <!-- Control Panel -->
+                <div class="control-panel">
                 <div class="control-group">
                     <label for="device-select">Audio Device</label>
                     <div class="select-wrapper">
@@ -105,6 +119,7 @@
                     </div>
                     <div id="translation-text" class="text-content"></div>
                 </div>
+            </div>
             </div>
         </div>
     </div>

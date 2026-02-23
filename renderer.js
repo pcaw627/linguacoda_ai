@@ -14,13 +14,48 @@ let scrollSyncTimeout = null; // Timeout for scroll sync
 let scrollSyncRaf = null; // RequestAnimationFrame ID for scroll sync
 let pendingScrollUpdate = false; // Flag to prevent multiple RAF calls
 
+// View navigation
+let currentView = 'menu'; // 'menu' or 'transcription'
+
+function showMenuView() {
+    document.getElementById('menu-view').style.display = 'flex';
+    document.getElementById('transcription-view').style.display = 'none';
+    currentView = 'menu';
+}
+
+function showTranscriptionView() {
+    document.getElementById('menu-view').style.display = 'none';
+    document.getElementById('transcription-view').style.display = 'flex';
+    currentView = 'transcription';
+}
+
 // Initialize
 document.addEventListener('DOMContentLoaded', async () => {
-    console.log('Initializing Language Learning Assistant...');
+    console.log('Initializing LinguaCoda Language Learning Suite...');
     
+    // Setup window controls (always available)
+    setupWindowControls();
+    
+    // Show menu view initially
+    showMenuView();
+    
+    // Setup menu navigation
+    document.getElementById('subtitles-translation-btn').addEventListener('click', () => {
+        showTranscriptionView();
+        // Initialize transcription view components when first shown
+        initializeTranscriptionView();
+    });
+    
+    console.log('Application window ready. Starting main loop...');
+});
+
+// Initialize transcription view (called when navigating to it)
+async function initializeTranscriptionView() {
     // Load config
-    config = await window.electronAPI.getConfig();
-    volumeThreshold = config.volumeThreshold;
+    if (!config) {
+        config = await window.electronAPI.getConfig();
+        volumeThreshold = config.volumeThreshold;
+    }
     
     // Load saved font size from localStorage
     const savedFontSize = localStorage.getItem('fontSize');
@@ -37,12 +72,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Update threshold slider
     document.getElementById('volume-threshold').value = volumeThreshold;
     updateThresholdDisplay();
-    
-    console.log('Application window ready. Starting main loop...');
-});
+}
 
-// Setup event listeners
-function setupEventListeners() {
+// Setup window controls (always available)
+function setupWindowControls() {
     // Window controls
     document.getElementById('minimize-btn').addEventListener('click', () => {
         window.electronAPI.windowMinimize();
@@ -55,6 +88,11 @@ function setupEventListeners() {
     document.getElementById('close-btn').addEventListener('click', () => {
         window.electronAPI.windowClose();
     });
+}
+
+// Setup event listeners for transcription view
+function setupEventListeners() {
+    // Window controls are set up separately in setupWindowControls()
     
     // Device selection
     document.getElementById('device-select').addEventListener('change', (e) => {
@@ -183,6 +221,23 @@ function setupScrollSync() {
     
     // Function to queue scroll sync
     function syncScroll(source, target) {
+        // When capturing, prevent user scrolling - only allow programmatic scrolling
+        if (isCapturing) {
+            // If user tried to scroll while capturing, reset to bottom
+            // But only if it's not a programmatic scroll (isUserScrolling flag)
+            if (!isUserScrolling) {
+                requestAnimationFrame(() => {
+                    if (isCapturing && !isUserScrolling) {
+                        const sourceMaxScroll = source.scrollHeight - source.clientHeight;
+                        const targetMaxScroll = target.scrollHeight - target.clientHeight;
+                        source.scrollTop = Math.max(0, sourceMaxScroll);
+                        target.scrollTop = Math.max(0, targetMaxScroll);
+                    }
+                });
+            }
+            return;
+        }
+        
         // Don't sync if we're already syncing (prevents infinite loops)
         if (isUserScrolling && pendingScrollUpdate) return;
         
@@ -207,6 +262,18 @@ function setupScrollSync() {
     translationContainer.addEventListener('scroll', () => {
         syncScroll(translationContainer, transcriptionContainer);
     }, { passive: true });
+    
+    // Prevent manual scrolling when capturing (but allow Ctrl+scroll for zoom)
+    function handleWheel(e) {
+        if (isCapturing && !e.ctrlKey) {
+            // Prevent scrolling when capturing (unless Ctrl is held for zoom)
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }
+    
+    transcriptionContainer.addEventListener('wheel', handleWheel, { passive: false });
+    translationContainer.addEventListener('wheel', handleWheel, { passive: false });
 }
 
 // Setup Electron IPC listeners
@@ -325,6 +392,8 @@ async function startCapture() {
     const result = await window.electronAPI.startCapture(selectedDeviceId, selectedDeviceType);
     if (result.success) {
         isCapturing = true;
+        // When starting capture, scroll to bottom and enable autoscroll
+        forceScrollToBottom();
         updateUI();
         updateStatus('Capturing...', 'capturing');
     } else {
@@ -339,6 +408,17 @@ async function stopCapture() {
     const result = await window.electronAPI.stopCapture();
     if (result.success) {
         isCapturing = false;
+        // When stopping capture, check current scroll position
+        const transcriptionContainer = document.getElementById('transcription-text');
+        const translationContainer = document.getElementById('translation-text');
+        if (transcriptionContainer && translationContainer) {
+            // Update isAtBottom based on current position
+            const threshold = 5;
+            const transcriptionMaxScroll = transcriptionContainer.scrollHeight - transcriptionContainer.clientHeight;
+            const translationMaxScroll = translationContainer.scrollHeight - translationContainer.clientHeight;
+            isAtBottom = (transcriptionMaxScroll <= 0 || transcriptionContainer.scrollTop >= transcriptionMaxScroll - threshold) &&
+                        (translationMaxScroll <= 0 || translationContainer.scrollTop >= translationMaxScroll - threshold);
+        }
         updateUI();
         updateStatus('Stopped', 'stopped');
     }
@@ -459,6 +539,55 @@ function updateDisplay() {
     // Use requestAnimationFrame to ensure layout is complete
     requestAnimationFrame(() => {
         recalculatePairHeights(pairWrappers);
+        // If capturing, ensure we scroll to bottom after layout
+        if (isCapturing) {
+            forceScrollToBottom();
+        }
+    });
+}
+
+// Force scroll to bottom (used when capturing)
+function forceScrollToBottom() {
+    const transcriptionContainer = document.getElementById('transcription-text');
+    const translationContainer = document.getElementById('translation-text');
+    if (!transcriptionContainer || !translationContainer) return;
+    
+    // Use double requestAnimationFrame to ensure layout is complete
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            isUserScrolling = true;
+            const transcriptionMaxScroll = transcriptionContainer.scrollHeight - transcriptionContainer.clientHeight;
+            const translationMaxScroll = translationContainer.scrollHeight - translationContainer.clientHeight;
+            
+            // Scroll to bottom
+            if (transcriptionMaxScroll > 0) {
+                transcriptionContainer.scrollTop = transcriptionMaxScroll;
+            }
+            if (translationMaxScroll > 0) {
+                translationContainer.scrollTop = translationMaxScroll;
+            }
+            
+            isAtBottom = true;
+            
+            // Verify scroll worked, retry if needed (sometimes layout takes longer)
+            setTimeout(() => {
+                const currentTranscriptionScroll = transcriptionContainer.scrollTop;
+                const currentTranslationScroll = translationContainer.scrollTop;
+                const expectedTranscriptionScroll = transcriptionContainer.scrollHeight - transcriptionContainer.clientHeight;
+                const expectedTranslationScroll = translationContainer.scrollHeight - translationContainer.clientHeight;
+                
+                // If we're not at the bottom, try again
+                if (isCapturing && (
+                    (expectedTranscriptionScroll > 0 && Math.abs(currentTranscriptionScroll - expectedTranscriptionScroll) > 1) ||
+                    (expectedTranslationScroll > 0 && Math.abs(currentTranslationScroll - expectedTranslationScroll) > 1)
+                )) {
+                    transcriptionContainer.scrollTop = expectedTranscriptionScroll;
+                    translationContainer.scrollTop = expectedTranslationScroll;
+                }
+                
+                isUserScrolling = false;
+            }, 100);
+        });
     });
 }
 
@@ -515,21 +644,46 @@ function recalculatePairHeights(pairWrappers) {
         }
     });
     
-    // Auto-scroll only if user is at the bottom
-    if (isAtBottom) {
-        // Use requestAnimationFrame to ensure DOM is fully updated
+    // Auto-scroll behavior based on capture state
+    // Use double requestAnimationFrame to ensure layout is complete before scrolling
+    if (isCapturing) {
+        // When capturing, always autoscroll to bottom
         requestAnimationFrame(() => {
-            // Temporarily disable scroll sync to prevent recursive events
-            isUserScrolling = true;
-            transcriptionContainer.scrollTop = transcriptionContainer.scrollHeight;
-            translationContainer.scrollTop = translationContainer.scrollHeight;
-            // Update isAtBottom flag after scrolling
-            isAtBottom = true;
-            // Re-enable scroll sync after a brief delay
-            setTimeout(() => {
-                isUserScrolling = false;
-            }, 50);
+            requestAnimationFrame(() => {
+                // Temporarily disable scroll sync to prevent recursive events
+                isUserScrolling = true;
+                const transcriptionMaxScroll = transcriptionContainer.scrollHeight - transcriptionContainer.clientHeight;
+                const translationMaxScroll = translationContainer.scrollHeight - translationContainer.clientHeight;
+                transcriptionContainer.scrollTop = Math.max(0, transcriptionMaxScroll);
+                translationContainer.scrollTop = Math.max(0, translationMaxScroll);
+                // Update isAtBottom flag after scrolling
+                isAtBottom = true;
+                // Re-enable scroll sync after a brief delay
+                setTimeout(() => {
+                    isUserScrolling = false;
+                }, 50);
+            });
         });
+    } else {
+        // When not capturing, only autoscroll if user is at the bottom
+        if (isAtBottom) {
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    // Temporarily disable scroll sync to prevent recursive events
+                    isUserScrolling = true;
+                    const transcriptionMaxScroll = transcriptionContainer.scrollHeight - transcriptionContainer.clientHeight;
+                    const translationMaxScroll = translationContainer.scrollHeight - translationContainer.clientHeight;
+                    transcriptionContainer.scrollTop = Math.max(0, transcriptionMaxScroll);
+                    translationContainer.scrollTop = Math.max(0, translationMaxScroll);
+                    // Update isAtBottom flag after scrolling
+                    isAtBottom = true;
+                    // Re-enable scroll sync after a brief delay
+                    setTimeout(() => {
+                        isUserScrolling = false;
+                    }, 50);
+                });
+            });
+        }
     }
 }
 
