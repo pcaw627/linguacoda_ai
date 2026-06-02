@@ -25,6 +25,7 @@ class AudioCapture:
         self.device_id = device_id
         self.is_capturing = False
         self.stream = None
+        self.stream_channels = config.CHANNELS
         self.audio_queue = queue.Queue()
         
     def _audio_callback(self, indata, frames, time, status):
@@ -291,15 +292,38 @@ class AudioCapture:
                     if self.device_id is None:
                         raise RuntimeError("No audio input device found. Please configure a loopback device.")
             
-            # Open audio stream (as input stream for loopback)
-            self.stream = sd.InputStream(
-                device=self.device_id,
-                channels=config.CHANNELS,
-                samplerate=config.SAMPLE_RATE,
-                blocksize=config.CHUNK_SIZE,
-                callback=self._audio_callback,
-                dtype=np.float32
-            )
+            device_info = sd.query_devices(self.device_id)
+            self.stream_channels = config.CHANNELS
+            
+            try:
+                # Prefer mono at the ASR sample rate. Some WASAPI devices reject
+                # mono streams even though their input can be downmixed afterward.
+                self.stream = sd.InputStream(
+                    device=self.device_id,
+                    channels=self.stream_channels,
+                    samplerate=config.SAMPLE_RATE,
+                    blocksize=config.CHUNK_SIZE,
+                    callback=self._audio_callback,
+                    dtype=np.float32
+                )
+            except sd.PortAudioError as e:
+                max_input_channels = int(device_info.get('max_input_channels', 0) or 0)
+                if "Invalid number of channels" not in str(e) or max_input_channels <= config.CHANNELS:
+                    raise
+                
+                self.stream_channels = min(max_input_channels, 2)
+                print(
+                    f"Retrying audio stream with {self.stream_channels} channels "
+                    f"for device {self.device_id}: {device_info['name']}"
+                )
+                self.stream = sd.InputStream(
+                    device=self.device_id,
+                    channels=self.stream_channels,
+                    samplerate=config.SAMPLE_RATE,
+                    blocksize=config.CHUNK_SIZE,
+                    callback=self._audio_callback,
+                    dtype=np.float32
+                )
             
             self.is_capturing = True
             self.stream.start()

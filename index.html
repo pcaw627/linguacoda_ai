@@ -35,11 +35,50 @@
         <!-- Menu View -->
         <div id="menu-view" class="view-container menu-view">
             <div class="menu-content">
-                <h1 class="menu-title">LinguaCoda Language Learning Suite</h1>
+                <h1 class="menu-title">
+                    <img class="title-flourish title-flourish-left" src="assets/images/title_flourish.png" alt="">
+                    <span class="menu-title-text">LinguaCoda Language Learning Suite</span>
+                    <img class="title-flourish title-flourish-right" src="assets/images/title_flourish.png" alt="">
+                </h1>
                 <div class="menu-buttons">
                     <button id="subtitles-translation-btn" class="menu-button">
                         <span class="menu-button-text">Subtitles and Translation</span>
                     </button>
+                </div>
+            </div>
+
+            <!-- Vocab Tracker -->
+            <div class="vocab-tracker" id="vocab-tracker">
+                <div class="vocab-tracker-header">
+                    <h2 class="vocab-tracker-title">HSK Vocab Tracker</h2>
+                    <span class="vocab-tracker-stats" id="vocab-tracker-stats"></span>
+                </div>
+                <div class="vocab-tracker-grid-container" id="vocab-tracker-grid">
+                    <!-- HSK level sections will be populated by JS -->
+                    <div class="vocab-tracker-loading">Loading HSK dictionary...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Vocab Context Modal -->
+        <div id="vocab-context-modal" class="vocab-context-modal" style="display: none;">
+            <div class="vocab-context-overlay"></div>
+            <div class="vocab-context-content">
+                <div class="vocab-context-header">
+                    <h2 id="vocab-context-word" class="vocab-context-word"></h2>
+                    <button id="vocab-context-close" class="detail-close-btn" title="Close">
+                        <svg width="16" height="16" viewBox="0 0 16 16">
+                            <path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="vocab-context-body">
+                    <div id="vocab-context-loading" class="detail-loading" style="display: none;">
+                        <div class="loading-spinner"></div>
+                        <p>Generating context...</p>
+                    </div>
+                    <div id="vocab-context-text" class="vocab-context-text" style="display: none;"></div>
+                    <div id="vocab-context-error" class="detail-error" style="display: none;"></div>
                 </div>
             </div>
         </div>
@@ -50,6 +89,11 @@
             <div class="main-content">
                 <!-- Control Panel -->
                 <div class="control-panel">
+                <button id="back-btn" class="btn btn-back" title="Back to Home" aria-label="Back to Home">
+                    <svg class="back-arrow" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                        <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="currentColor"/>
+                    </svg>
+                </button>
                 <div class="control-group">
                     <label for="device-select">Audio Device</label>
                     <div class="select-wrapper">
@@ -77,6 +121,18 @@
                         <option value="ko">Korean</option>
                     </select>
                     <span id="detected-lang" class="detected-lang">Detected: auto</span>
+                </div>
+
+                <div class="control-group hsk-control" id="hsk-control" style="display: none;">
+                    <label for="hsk-level-select">HSK Level</label>
+                    <select id="hsk-level-select" class="styled-select">
+                        <option value="1">HSK 1</option>
+                        <option value="2">HSK 2</option>
+                        <option value="3" selected>HSK 3</option>
+                        <option value="4">HSK 4</option>
+                        <option value="5">HSK 5</option>
+                        <option value="6">HSK 6</option>
+                    </select>
                 </div>
 
                 <div class="control-group">
@@ -120,6 +176,38 @@
                     <div id="translation-text" class="text-content"></div>
                 </div>
             </div>
+            </div>
+        </div>
+
+        <!-- Detail View Modal -->
+        <div id="detail-view-modal" class="detail-modal" style="display: none;">
+            <div class="detail-modal-overlay"></div>
+            <div class="detail-modal-content">
+                <div class="detail-modal-header">
+                    <h2>Semantic Unit Mapping</h2>
+                    <button id="detail-view-close" class="detail-close-btn" title="Close">
+                        <svg width="16" height="16" viewBox="0 0 16 16">
+                            <path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="detail-modal-body">
+                    <div id="detail-loading" class="detail-loading" style="display: none;">
+                        <div class="loading-spinner"></div>
+                        <p>Analyzing semantic units...</p>
+                    </div>
+                    <div id="detail-content" class="detail-content" style="display: none;">
+                        <div class="detail-sentence-container">
+                            <div class="detail-sentence-label">Original</div>
+                            <div id="detail-transcription" class="detail-sentence"></div>
+                        </div>
+                        <div class="detail-sentence-container">
+                            <div class="detail-sentence-label">Translation</div>
+                            <div id="detail-translation" class="detail-sentence"></div>
+                        </div>
+                    </div>
+                    <div id="detail-error" class="detail-error" style="display: none;"></div>
+                </div>
             </div>
         </div>
     </div>

@@ -9,9 +9,26 @@ import queue
 import numpy as np
 import time
 from audio_capture import AudioCapture
+from soundcard_capture import SoundcardLoopbackCapture, list_output_endpoints
 from transcription_client import TranscriptionClient
 from device_cache import load_cache, save_cache, find_stereo_mix_device
 import config
+
+
+def _is_output_kind(device_type: str) -> bool:
+    return device_type in ("output", "loopback", "possible_loopback", "default")
+
+
+def _coerce_device_id(device_id, device_type):
+    """Soundcard endpoint IDs are strings; sounddevice IDs are ints."""
+    if device_id is None or device_id == "":
+        return None
+    if _is_output_kind(device_type):
+        return str(device_id)
+    try:
+        return int(device_id)
+    except (ValueError, TypeError):
+        return device_id
 
 class ElectronBackend:
     def __init__(self):
@@ -68,7 +85,7 @@ class ElectronBackend:
         
         try:
             self._transcriber_initializing = True
-            print("Connecting to transcription server...", file=sys.stderr)
+            print("Connecting to transcription server...", file=sys.stdout)
             self.transcriber = TranscriptionClient()
             
             # Check if server is running
@@ -77,7 +94,7 @@ class ElectronBackend:
                 # Don't fail here - the server might start later
                 # The client will handle reconnection attempts
             else:
-                print("Connected to transcription server", file=sys.stderr)
+                print("Connected to transcription server", file=sys.stdout)
         except Exception as e:
             import traceback
             print(f"Failed to initialize transcription client: {e}", file=sys.stderr)
@@ -262,52 +279,57 @@ class ElectronBackend:
             print(traceback.format_exc(), file=sys.stderr)
             self._send_error(f"Error processing audio: {e}")
     
-    def start_capture(self, device_id=None, output_device_id=None):
-        """Start audio capture
+    def start_capture(self, device_id=None, device_type="input"):
+        """Start audio capture.
         
         Args:
-            device_id: Input device ID (for microphones)
-            output_device_id: Output device ID (for loopback - captures from this output device)
+            device_id: For microphones, the sounddevice integer device ID.
+                For speaker-output loopback, the soundcard endpoint ID (string).
+            device_type: "input" for microphones, "output"/"loopback" for
+                Windows render-endpoint loopback via soundcard.
         """
         if self.is_capturing:
             print("Already capturing, ignoring start request", file=sys.stderr)
             return
         
         try:
-            # Reset audio tracking
             self._chunk_count = 0
             self.audio_buffer = []
             self.buffer_start_time = None
             self.silence_start_time = None
             
-            # If output_device_id is specified, find the corresponding loopback device
-            if output_device_id is not None:
-                print(f"Finding loopback device for output device {output_device_id}", file=sys.stderr)
-                device_id = self._find_loopback_for_output(output_device_id)
+            if _is_output_kind(device_type):
                 if device_id is None:
-                    self._send_error(f"No loopback device found for output device {output_device_id}")
+                    self._send_error("No output device specified for loopback capture")
                     return
-                print(f"Found loopback device ID: {device_id}", file=sys.stderr)
-                # Save the output device selection
-                self._save_device_selection(output_device_id, 'output')
-            elif device_id is not None:
-                # Validate device exists before trying to use it
+                print(
+                    f"Starting WASAPI loopback capture for endpoint {device_id}",
+                    file=sys.stderr,
+                )
+                self.audio_capture = SoundcardLoopbackCapture(
+                    self._audio_callback, str(device_id)
+                )
+                self._save_device_selection(device_id, "output")
+            else:
+                if device_id is None:
+                    self._send_error("No input device specified")
+                    return
                 try:
                     import sounddevice as sd
                     device_info = sd.query_devices(device_id)
-                    print(f"Using input device {device_id}: {device_info['name']}", file=sys.stderr)
-                except Exception as e:
-                    self._send_error(f"Device {device_id} is no longer available. Please refresh device list.")
-                    # Refresh device list
+                    print(
+                        f"Using input device {device_id}: {device_info['name']}",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    self._send_error(
+                        f"Device {device_id} is no longer available. Please refresh device list."
+                    )
                     self.get_audio_devices(use_cache=False, force_refresh=True)
                     return
-                # Save the input device selection
-                self._save_device_selection(device_id, 'input')
-            else:
-                print("No device specified, using default", file=sys.stderr)
+                self.audio_capture = AudioCapture(self._audio_callback, device_id)
+                self._save_device_selection(device_id, "input")
             
-            print(f"Starting audio capture on device {device_id}", file=sys.stderr)
-            self.audio_capture = AudioCapture(self._audio_callback, device_id)
             self.audio_capture.start()
             self.is_capturing = True
             print("Audio capture started successfully", file=sys.stderr)
@@ -317,26 +339,37 @@ class ElectronBackend:
             print(f"Failed to start capture: {e}", file=sys.stderr)
             print(traceback.format_exc(), file=sys.stderr)
             self._send_error(f"Failed to start capture: {e}")
-            # If device is invalid, refresh device list
             if "device" in str(e).lower() or "not found" in str(e).lower():
                 self.get_audio_devices(use_cache=False, force_refresh=True)
     
     def _save_device_selection(self, device_id, device_type):
-        """Save device selection to cache"""
+        """Save device selection to cache."""
         try:
-            # Get current device list
-            temp_capture = AudioCapture(lambda x: None)
-            devices = temp_capture.get_all_audio_devices(use_cache=True)
+            cached = load_cache()
+            devices = cached.get('devices', []) if cached else []
             
-            # Find the selected device
+            wants_output = _is_output_kind(device_type)
             selected_device = None
             for device in devices:
-                if device['id'] == device_id:
+                if device.get('id') != device_id:
+                    continue
+                device_name = device.get('name', '')
+                device_is_output = (
+                    '[Speaker Output]' in device_name
+                    or _is_output_kind(device.get('type', 'input'))
+                )
+                if device_is_output == wants_output:
                     selected_device = device
                     break
             
-            if selected_device:
-                save_cache(devices, device_id, device_type, selected_device['name'])
+            if selected_device is None:
+                print(
+                    f"Warning: selected device {device_id} ({device_type}) not in cache",
+                    file=sys.stderr,
+                )
+                return
+            
+            save_cache(devices, device_id, device_type, selected_device['name'])
         except Exception as e:
             print(f"Warning: Failed to save device selection: {e}", file=sys.stderr)
     
@@ -417,7 +450,7 @@ class ElectronBackend:
                 if cached_data and cached_data.get('devices'):
                     # Return cached devices immediately without validation for fast startup
                     # Validation will happen when user tries to start capture
-                    print(f"Using cached devices (count: {len(cached_data['devices'])})", file=sys.stderr)
+                    print(f"Using cached devices (count: {len(cached_data['devices'])})", file=sys.stdout)
                     devices = cached_data['devices']
                     return self._format_devices_for_electron(devices, cached_data)
                 else:
@@ -427,43 +460,43 @@ class ElectronBackend:
             print("Refreshing device list (this may take a few seconds)...", file=sys.stderr)
             temp_capture = AudioCapture(lambda x: None)
             input_devices = temp_capture.get_input_devices()
-            loopback_devices = temp_capture.get_loopback_devices()
             
-            # Get all output devices directly from sounddevice
-            all_devices = sd.query_devices()
-            output_devices = []
+            # Speaker-output loopback options come from soundcard, which uses
+            # WASAPI loopback on the real render endpoint and does not mute
+            # the device the user is listening to.
+            try:
+                output_endpoints = list_output_endpoints()
+            except Exception as e:
+                print(f"Failed to enumerate output endpoints via soundcard: {e}", file=sys.stderr)
+                output_endpoints = []
             
-            for i, device in enumerate(all_devices):
-                # Only include devices that have output channels
-                if device['max_output_channels'] > 0:
-                    output_devices.append({
-                        "id": i,
-                        "name": device['name']
-                    })
+            input_list = [
+                {"id": d["id"], "name": f"[Microphone] {d['name']}", "type": d.get("type", "input")}
+                for d in input_devices
+            ]
             
-            # Format input devices (microphones)
-            input_list = [{"id": d["id"], "name": f"[Microphone] {d['name']}"} for d in input_devices]
+            output_list = [
+                {"id": d["id"], "name": f"[Speaker Output] {d['name']}", "type": "output"}
+                for d in output_endpoints
+            ]
             
-            # Format output devices (for loopback selection)
-            output_list = [{"id": d["id"], "name": f"[Speaker Output] {d['name']}"} for d in output_devices]
-            
-            # Combine all devices for caching (same format as main.py)
             all_combined_devices = []
             for device in input_devices:
                 all_combined_devices.append({
                     **device,
-                    'name': f"[Microphone] {device['name']}"
+                    'name': f"[Microphone] {device['name']}",
                 })
-            for device in loopback_devices:
+            for device in output_endpoints:
                 all_combined_devices.append({
                     **device,
-                    'name': f"[Speaker Output] {device['name']}"
+                    'name': f"[Speaker Output] {device['name']}",
                 })
             
             # Try to get default device (cached or stereo mix)
             cached_data = load_cache() if use_cache else None
             default_device = None
             default_device_id = None
+            default_device_type = None
             
             if cached_data and cached_data.get('selected_device_id') is not None:
                 # Check if cached device is still available
@@ -472,6 +505,7 @@ class ElectronBackend:
                     if device['id'] == cached_device_id:
                         default_device = device
                         default_device_id = cached_device_id
+                        default_device_type = device.get('type', 'input')
                         break
             
             # If no cached device or unavailable, try stereo mix
@@ -480,11 +514,12 @@ class ElectronBackend:
                 if stereo_mix:
                     default_device = stereo_mix
                     default_device_id = stereo_mix['id']
+                    default_device_type = stereo_mix.get('type', 'input')
             
             # Save to cache (always save device list, even if no default device)
             print(f"Saving device cache: {len(all_combined_devices)} devices", file=sys.stderr)
             save_cache(all_combined_devices, default_device_id,
-                      default_device.get('type', 'input') if default_device else None,
+                      default_device_type,
                       default_device['name'] if default_device else None)
             
             # Send devices with type information
@@ -492,7 +527,7 @@ class ElectronBackend:
                 "input": input_list,
                 "output": output_list,
                 "defaultDeviceId": default_device_id,
-                "defaultDeviceType": default_device.get('type', 'input') if default_device else None
+                "defaultDeviceType": default_device_type
             }
             
             self._send_message("audio-devices", device_list)
@@ -515,15 +550,17 @@ class ElectronBackend:
             device_id = device.get('id')
             device_type = device.get('type', 'input')
             
-            if '[Microphone]' in device_name:
-                input_list.append({
-                    "id": device_id,
-                    "name": device_name
-                })
-            elif '[Speaker Output]' in device_name:
+            if '[Speaker Output]' in device_name:
                 output_list.append({
                     "id": device_id,
-                    "name": device_name
+                    "name": device_name,
+                    "type": "output",
+                })
+            elif '[Microphone]' in device_name:
+                input_list.append({
+                    "id": device_id,
+                    "name": device_name,
+                    "type": device_type if device_type == 'input' else 'input',
                 })
         
         device_list = {
@@ -570,21 +607,9 @@ def main():
             
             if action == "start":
                 device_id = command.get("deviceId")
-                device_type = command.get("deviceType", "input")  # "input" or "output"
-                
-                # Convert device_id to int if it's a valid string/number, else None
-                parsed_device_id = None
-                if device_id and device_id != "":
-                    try:
-                        parsed_device_id = int(device_id)
-                    except (ValueError, TypeError):
-                        parsed_device_id = None
-                
-                # If it's an output device, we want loopback from it
-                if device_type == "output":
-                    backend.start_capture(device_id=None, output_device_id=parsed_device_id)
-                else:
-                    backend.start_capture(device_id=parsed_device_id, output_device_id=None)
+                device_type = command.get("deviceType", "input")
+                parsed_device_id = _coerce_device_id(device_id, device_type)
+                backend.start_capture(device_id=parsed_device_id, device_type=device_type)
             elif action == "stop":
                 backend.stop_capture()
             elif action == "get-devices":
@@ -599,8 +624,9 @@ def main():
             elif action == "save-device-selection":
                 device_id = command.get("deviceId")
                 device_type = command.get("deviceType", "input")
-                if device_id is not None:
-                    backend._save_device_selection(int(device_id), device_type)
+                parsed_device_id = _coerce_device_id(device_id, device_type)
+                if parsed_device_id is not None:
+                    backend._save_device_selection(parsed_device_id, device_type)
         except json.JSONDecodeError:
             continue
         except Exception as e:

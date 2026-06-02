@@ -8,10 +8,12 @@ from typing import Optional, Dict, List, Any
 
 
 CACHE_FILE = Path(__file__).parent / "device_cache.json"
+CACHE_VERSION = 2  # bump when device schema/source changes (e.g. soundcard endpoints)
 
 
 def load_cache() -> Optional[Dict[str, Any]]:
-    """Load device cache from file"""
+    """Load device cache from file. Older versions are ignored so the caller
+    will refresh from a fresh enumeration."""
     if not CACHE_FILE.exists():
         print(f"Device cache file not found: {CACHE_FILE}")
         return None
@@ -19,6 +21,11 @@ def load_cache() -> Optional[Dict[str, Any]]:
     try:
         with open(CACHE_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
+            if data.get('version') != CACHE_VERSION:
+                print(
+                    f"Ignoring stale device cache (version={data.get('version')!r}, expected {CACHE_VERSION})"
+                )
+                return None
             device_count = len(data.get('devices', []))
             print(f"Loaded device cache: {device_count} devices, selected device ID: {data.get('selected_device_id')}")
             return data
@@ -27,10 +34,11 @@ def load_cache() -> Optional[Dict[str, Any]]:
         return None
 
 
-def save_cache(devices: List[Dict[str, Any]], selected_device_id: Optional[int] = None, 
+def save_cache(devices: List[Dict[str, Any]], selected_device_id: Optional[Any] = None,
                selected_device_type: Optional[str] = None, selected_device_name: Optional[str] = None):
     """Save device cache to file"""
     cache_data = {
+        "version": CACHE_VERSION,
         "devices": devices,
         "selected_device_id": selected_device_id,
         "selected_device_type": selected_device_type,

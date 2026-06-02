@@ -7,7 +7,6 @@ let selectedDeviceType = 'input'; // 'input' or 'output'
 let selectedLanguage = 'auto';
 let volumeThreshold = 0.0001;
 let detectedLanguage = 'auto';
-let fontSize = 15; // Default font size in pixels
 let isUserScrolling = false; // Track if user is manually scrolling
 let isAtBottom = true; // Track if user is at the bottom
 let scrollSyncTimeout = null; // Timeout for scroll sync
@@ -17,10 +16,18 @@ let pendingScrollUpdate = false; // Flag to prevent multiple RAF calls
 // View navigation
 let currentView = 'menu'; // 'menu' or 'transcription'
 
+// Vocab tracker state
+let seenVocab = JSON.parse(localStorage.getItem('seenVocab') || '{}'); // { word: count }
+let allHskWords = {}; // { word: hskLevel } loaded from local JSON
+let vocabContextCache = {}; // Cache for Ollama-generated contexts
+let pinyinCache = JSON.parse(localStorage.getItem('pinyinCache') || '{}'); // { word: pinyinString }
+
 function showMenuView() {
     document.getElementById('menu-view').style.display = 'flex';
     document.getElementById('transcription-view').style.display = 'none';
     currentView = 'menu';
+    // Refresh vocab tracker when returning to menu
+    initializeVocabTracker();
 }
 
 function showTranscriptionView() {
@@ -36,14 +43,38 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Setup window controls (always available)
     setupWindowControls();
     
+    // Ctrl+scroll zoom — sends IPC to main process which handles webContents zoom
+    document.addEventListener('wheel', (e) => {
+        if (e.ctrlKey) {
+            e.preventDefault();
+            if (e.deltaY < 0) {
+                window.electronAPI.zoomIn();
+            } else {
+                window.electronAPI.zoomOut();
+            }
+        }
+    }, { passive: false });
+    
     // Show menu view initially
     showMenuView();
+    
+    // Initialize vocab tracker on the menu page
+    initializeVocabTracker();
     
     // Setup menu navigation
     document.getElementById('subtitles-translation-btn').addEventListener('click', () => {
         showTranscriptionView();
         // Initialize transcription view components when first shown
         initializeTranscriptionView();
+    });
+    
+    // Back button (always wire up, it's in the transcription view)
+    document.getElementById('back-btn').addEventListener('click', async () => {
+        // Stop capture if active before navigating back
+        if (isCapturing) {
+            await stopCapture();
+        }
+        showMenuView();
     });
     
     console.log('Application window ready. Starting main loop...');
@@ -56,13 +87,6 @@ async function initializeTranscriptionView() {
         config = await window.electronAPI.getConfig();
         volumeThreshold = config.volumeThreshold;
     }
-    
-    // Load saved font size from localStorage
-    const savedFontSize = localStorage.getItem('fontSize');
-    if (savedFontSize) {
-        fontSize = parseInt(savedFontSize, 10);
-    }
-    applyFontSize();
     
     // Setup UI
     setupEventListeners();
@@ -130,20 +154,6 @@ function setupEventListeners() {
     // Control buttons
     document.getElementById('start-btn').addEventListener('click', startCapture);
     document.getElementById('stop-btn').addEventListener('click', stopCapture);
-    
-    // Zoom with Ctrl+scroll
-    const contentArea = document.querySelector('.content-area');
-    contentArea.addEventListener('wheel', (e) => {
-        if (e.ctrlKey) {
-            e.preventDefault();
-            const delta = e.deltaY > 0 ? -2 : 2;
-            fontSize = Math.max(10, Math.min(50, fontSize + delta));
-            applyFontSize();
-            localStorage.setItem('fontSize', fontSize.toString());
-            // Update display to apply new font size
-            updateDisplay();
-        }
-    }, { passive: false });
     
     // Setup scroll synchronization between transcription and translation containers
     setupScrollSync();
@@ -317,21 +327,6 @@ function populateDeviceSelect(devices) {
     select.innerHTML = '';
     
     if (devices && devices.input && devices.output) {
-        // Add input devices
-        if (devices.input.length > 0) {
-            const inputGroup = document.createElement('optgroup');
-            inputGroup.label = 'Microphones';
-            devices.input.forEach((device) => {
-                const option = document.createElement('option');
-                option.value = device.id;
-                option.textContent = device.name;
-                option.dataset.type = 'input';
-                inputGroup.appendChild(option);
-            });
-            select.appendChild(inputGroup);
-        }
-        
-        // Add output devices
         if (devices.output.length > 0) {
             const outputGroup = document.createElement('optgroup');
             outputGroup.label = 'Speaker Output (Loopback)';
@@ -339,10 +334,23 @@ function populateDeviceSelect(devices) {
                 const option = document.createElement('option');
                 option.value = device.id;
                 option.textContent = device.name;
-                option.dataset.type = 'output';
+                option.dataset.type = device.type || 'loopback';
                 outputGroup.appendChild(option);
             });
             select.appendChild(outputGroup);
+        }
+        
+        if (devices.input.length > 0) {
+            const inputGroup = document.createElement('optgroup');
+            inputGroup.label = 'Microphones';
+            devices.input.forEach((device) => {
+                const option = document.createElement('option');
+                option.value = device.id;
+                option.textContent = device.name;
+                option.dataset.type = device.type || 'input';
+                inputGroup.appendChild(option);
+            });
+            select.appendChild(inputGroup);
         }
         
         // Select default device from cache, or stereo mix, or first device
@@ -424,6 +432,60 @@ async function stopCapture() {
     }
 }
 
+// Split text by sentence-ending punctuation
+function splitIntoSentences(text) {
+    if (!text || !text.trim()) return [];
+    
+    // Sentence-ending punctuation patterns:
+    // - Single or multiple periods: . .. ...
+    // - Chinese period: 。
+    // - Full-width period: ．
+    // - Ellipsis: ... (three or more periods)
+    // Match one or more of these at the end of a sentence
+    const sentenceEndRegex = /([.。．]{1,3}|\.{3,})/g;
+    
+    const sentences = [];
+    let lastIndex = 0;
+    let match;
+    
+    // Find all sentence endings
+    const matches = [];
+    while ((match = sentenceEndRegex.exec(text)) !== null) {
+        matches.push({
+            index: match.index,
+            length: match[0].length,
+            punctuation: match[0]
+        });
+    }
+    
+    // If no matches found, return the whole text as a single sentence
+    if (matches.length === 0) {
+        return [text.trim()];
+    }
+    
+    // Split text at each match
+    for (const match of matches) {
+        const endIndex = match.index + match.length;
+        const sentence = text.substring(lastIndex, endIndex).trim();
+        
+        if (sentence && !isOnlyPunctuation(sentence)) {
+            sentences.push(sentence);
+        }
+        
+        lastIndex = endIndex;
+    }
+    
+    // Add remaining text if any (text after last punctuation)
+    if (lastIndex < text.length) {
+        const remaining = text.substring(lastIndex).trim();
+        if (remaining && !isOnlyPunctuation(remaining)) {
+            sentences.push(remaining);
+        }
+    }
+    
+    return sentences.length > 0 ? sentences : [text.trim()];
+}
+
 // Handle transcription result
 async function handleTranscriptionResult(data) {
     const { transcription, detectedLang } = data;
@@ -441,14 +503,56 @@ async function handleTranscriptionResult(data) {
         updateDetectedLanguage(detectedLang, false);
     }
     
-    // Add transcription pair
-    transcriptionPairs.push({ transcription, translation: '' });
+    // Split transcription into sentences
+    const sentences = splitIntoSentences(transcription);
     
-    // Translate
-    translateText(transcription, transcriptionPairs.length - 1);
+    // Process each sentence as a separate pair
+    for (const sentence of sentences) {
+        if (!sentence || !sentence.trim() || isOnlyPunctuation(sentence)) {
+            continue;
+        }
+        
+        // Add transcription pair
+        transcriptionPairs.push({ transcription: sentence.trim(), translation: '' });
+        
+        // Translate
+        translateText(sentence.trim(), transcriptionPairs.length - 1);
+    }
+    
+    // Track vocab from Chinese transcriptions
+    if (Object.keys(allHskWords).length > 0) {
+        for (const sentence of sentences) {
+            trackVocabFromText(sentence);
+        }
+    }
     
     // Update display
     updateDisplay();
+}
+
+// Track HSK vocab words found in transcribed text
+function trackVocabFromText(text) {
+    if (!text || Object.keys(allHskWords).length === 0) return;
+    
+    // Greedy longest-match segmentation against the HSK dictionary
+    let i = 0;
+    while (i < text.length) {
+        let matched = false;
+        // Try longest match first (up to 6 chars for Chinese words)
+        for (let len = Math.min(6, text.length - i); len >= 1; len--) {
+            const candidate = text.substring(i, i + len);
+            if (allHskWords[candidate] !== undefined) {
+                // Found an HSK word — increment its seen count
+                seenVocab[candidate] = (seenVocab[candidate] || 0) + 1;
+                matched = true;
+                i += len;
+                break;
+            }
+        }
+        if (!matched) i++;
+    }
+    // Persist to localStorage
+    localStorage.setItem('seenVocab', JSON.stringify(seenVocab));
 }
 
 // Translate text
@@ -502,7 +606,10 @@ function updateDisplay() {
     // Create pair components with alignment
     const pairWrappers = [];
     
-    pairsToShow.forEach((pair, index) => {
+    pairsToShow.forEach((pair, displayIndex) => {
+        // Find the actual index in the full transcriptionPairs array
+        const actualIndex = transcriptionPairs.indexOf(pair);
+        
         // Create pair wrapper for transcription
         const transcriptionPairWrapper = document.createElement('div');
         transcriptionPairWrapper.className = 'pair-wrapper';
@@ -510,7 +617,10 @@ function updateDisplay() {
         const transcriptionEl = document.createElement('div');
         transcriptionEl.className = 'pair-transcription';
         transcriptionEl.textContent = pair.transcription || '';
-        transcriptionEl.style.fontSize = `${fontSize}px`;
+        if (actualIndex >= 0) {
+            transcriptionEl.dataset.pairIndex = actualIndex;
+            transcriptionEl.addEventListener('click', () => showDetailView(actualIndex));
+        }
         
         transcriptionPairWrapper.appendChild(transcriptionEl);
         transcriptionContainer.appendChild(transcriptionPairWrapper);
@@ -522,7 +632,10 @@ function updateDisplay() {
         const translationEl = document.createElement('div');
         translationEl.className = 'pair-translation';
         translationEl.textContent = pair.translation || '';
-        translationEl.style.fontSize = `${fontSize}px`;
+        if (actualIndex >= 0) {
+            translationEl.dataset.pairIndex = actualIndex;
+            translationEl.addEventListener('click', () => showDetailView(actualIndex));
+        }
         
         translationPairWrapper.appendChild(translationEl);
         translationContainer.appendChild(translationPairWrapper);
@@ -531,7 +644,7 @@ function updateDisplay() {
         pairWrappers.push({
             transcription: { wrapper: transcriptionPairWrapper, element: transcriptionEl },
             translation: { wrapper: translationPairWrapper, element: translationEl },
-            index: index
+            index: displayIndex
         });
     });
     
@@ -720,17 +833,6 @@ function updateThresholdDisplay() {
     document.getElementById('threshold-value').textContent = volumeThreshold.toFixed(4);
 }
 
-// Apply font size to text content
-function applyFontSize() {
-    // Font size is now applied directly in updateDisplay()
-    // This function is kept for compatibility but the actual application
-    // happens when we update the display
-    const pairElements = document.querySelectorAll('.pair-transcription, .pair-translation');
-    pairElements.forEach(el => {
-        el.style.fontSize = `${fontSize}px`;
-    });
-}
-
 // Check if text is only punctuation (including foreign punctuation)
 function isOnlyPunctuation(text) {
     if (!text || !text.trim()) return true;
@@ -745,4 +847,415 @@ function isOnlyPunctuation(text) {
     // Common punctuation marks
     const punctuationRegex = /^[\p{P}\p{S}]+$/u;
     return punctuationRegex.test(cleaned);
+}
+
+// Detail View Functions
+let currentDetailPairIndex = -1;
+
+// Show detail view for a pair
+async function showDetailView(pairIndex) {
+    const pair = transcriptionPairs[pairIndex];
+    if (!pair || !pair.transcription || !pair.translation) {
+        return;
+    }
+    
+    // Wait for translation if it's not ready yet
+    if (!pair.translation || pair.translation.trim() === '') {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (!pair.translation || pair.translation.trim() === '') {
+            alert('Translation not ready yet. Please wait for the translation to complete.');
+            return;
+        }
+    }
+    
+    currentDetailPairIndex = pairIndex;
+    
+    // Show modal
+    const modal = document.getElementById('detail-view-modal');
+    const loading = document.getElementById('detail-loading');
+    const content = document.getElementById('detail-content');
+    const error = document.getElementById('detail-error');
+    
+    modal.style.display = 'flex';
+    loading.style.display = 'flex';
+    content.style.display = 'none';
+    error.style.display = 'none';
+    
+    // Setup close button
+    document.getElementById('detail-view-close').onclick = () => {
+        modal.style.display = 'none';
+    };
+    
+    // Close on overlay click
+    document.querySelector('.detail-modal-overlay').onclick = (e) => {
+        if (e.target.classList.contains('detail-modal-overlay')) {
+            modal.style.display = 'none';
+        }
+    };
+    
+    // Extract semantic units (tokenize + correlate with retry)
+    try {
+        const result = await window.electronAPI.extractSemanticUnits(
+            pair.transcription,
+            pair.translation
+        );
+        
+        if (result.success && result.transcriptionChunks && result.translationChunks) {
+            renderDetailView(
+                pair.transcription,
+                pair.translation,
+                result.transcriptionChunks,
+                result.translationChunks,
+                result.correlations || []
+            );
+            loading.style.display = 'none';
+            content.style.display = 'flex';
+        } else {
+            throw new Error(result.error || 'Failed to extract semantic units');
+        }
+    } catch (err) {
+        console.error('Error extracting semantic units:', err);
+        loading.style.display = 'none';
+        error.style.display = 'block';
+        error.textContent = `Error: ${err.message || 'Failed to extract semantic units'}`;
+    }
+}
+
+// Render detail view with chunk-based cards and correlation highlighting
+function renderDetailView(transcription, translation, transcriptionChunks, translationChunks, correlations) {
+    const transcriptionContainer = document.getElementById('detail-transcription');
+    const translationContainer = document.getElementById('detail-translation');
+    
+    transcriptionContainer.innerHTML = '';
+    translationContainer.innerHTML = '';
+    
+    // Match LLM-tokenized chunks back to positions in the original text
+    const transSegments = matchChunksToText(transcription, transcriptionChunks);
+    const transLangSegments = matchChunksToText(translation, translationChunks);
+    
+    // Render each sentence's chunks as interactive cards
+    renderChunksAsCards(transcriptionContainer, transcription, transSegments, 'transcription');
+    renderChunksAsCards(translationContainer, translation, transLangSegments, 'translation');
+    
+    // Wire up hover highlighting driven by the correlation map
+    setupCorrelationHighlighting(correlations);
+}
+
+// Match an ordered list of chunks back to character positions in the original text.
+// Chunks are expected to be in sentence order; we advance a cursor so that repeated
+// words resolve to distinct occurrences.
+function matchChunksToText(text, chunks) {
+    if (!text || !chunks || chunks.length === 0) return [];
+    
+    const segments = [];
+    let searchPos = 0;
+    
+    for (const chunk of chunks) {
+        const chunkText = (chunk.text || '').trim();
+        if (!chunkText) continue;
+        
+        // Try exact match from current position
+        let pos = text.indexOf(chunkText, searchPos);
+        
+        // Fallback: case-insensitive from current position
+        if (pos === -1) {
+            const lower = text.toLowerCase();
+            pos = lower.indexOf(chunkText.toLowerCase(), searchPos);
+        }
+        
+        // Last resort: search from the beginning (out-of-order tolerance)
+        if (pos === -1) {
+            pos = text.indexOf(chunkText);
+            if (pos === -1) {
+                pos = text.toLowerCase().indexOf(chunkText.toLowerCase());
+            }
+        }
+        
+        if (pos >= 0) {
+            segments.push({
+                start: pos,
+                end: pos + chunkText.length,
+                text: text.substring(pos, pos + chunkText.length),
+                chunkId: chunk.id
+            });
+            searchPos = pos + chunkText.length;
+        }
+        // If chunk text can't be found at all, skip it (punctuation, parenthetical, etc.)
+    }
+    
+    // Sort by position for rendering
+    segments.sort((a, b) => a.start - b.start);
+    return segments;
+}
+
+// Render text with matched chunk segments as cards, filling gaps with plain text
+function renderChunksAsCards(container, fullText, segments, type) {
+    if (!fullText) return;
+    
+    if (segments.length === 0) {
+        container.textContent = fullText;
+        return;
+    }
+    
+    let currentPos = 0;
+    
+    for (const segment of segments) {
+        // Plain text before this card
+        if (segment.start > currentPos) {
+            container.appendChild(document.createTextNode(fullText.substring(currentPos, segment.start)));
+        }
+        
+        // The card itself
+        const card = document.createElement('span');
+        card.className = 'detail-card';
+        card.textContent = segment.text;
+        card.dataset.type = type;
+        card.dataset.chunkId = segment.chunkId;
+        container.appendChild(card);
+        
+        currentPos = segment.end;
+    }
+    
+    // Trailing text after last card
+    if (currentPos < fullText.length) {
+        container.appendChild(document.createTextNode(fullText.substring(currentPos)));
+    }
+}
+
+// Build a bidirectional correlation map and wire hover events on cards
+function setupCorrelationHighlighting(correlations) {
+    const cards = document.querySelectorAll('.detail-card');
+    
+    // Build lookup: chunkId → Set of correlated chunkIds
+    const correlationMap = {};
+    for (const corr of correlations) {
+        if (!corr || !corr.id) continue;
+        if (!correlationMap[corr.id]) correlationMap[corr.id] = new Set();
+        
+        if (corr.match) {
+            correlationMap[corr.id].add(corr.match);
+            // Reverse direction so hovering the translation card also highlights
+            if (!correlationMap[corr.match]) correlationMap[corr.match] = new Set();
+            correlationMap[corr.match].add(corr.id);
+        }
+    }
+    
+    cards.forEach(card => {
+        card.addEventListener('mouseenter', () => {
+            const chunkId = card.dataset.chunkId;
+            if (!chunkId) return;
+            
+            // Highlight this card
+            card.classList.add('highlighted');
+            
+            // Highlight all correlated cards
+            const linked = correlationMap[chunkId];
+            if (linked) {
+                cards.forEach(c => {
+                    if (linked.has(c.dataset.chunkId)) {
+                        c.classList.add('highlighted');
+                    }
+                });
+            }
+        });
+        
+        card.addEventListener('mouseleave', () => {
+            cards.forEach(c => c.classList.remove('highlighted'));
+        });
+    });
+}
+
+// ========== Vocab Tracker ==========
+
+// Initialize the vocab tracker (loads HSK dictionary, renders grid)
+async function initializeVocabTracker() {
+    // Load the HSK dictionary if not already loaded
+    if (Object.keys(allHskWords).length === 0) {
+        try {
+            const result = await window.electronAPI.getHskDictionary();
+            if (result.success && result.words) {
+                allHskWords = result.words;
+                console.log(`HSK dictionary loaded: ${Object.keys(allHskWords).length} words`);
+            } else {
+                console.error('Failed to load HSK dictionary:', result.error);
+                const grid = document.getElementById('vocab-tracker-grid');
+                if (grid) grid.innerHTML = '<p style="color: var(--text-secondary); text-align: center;">Failed to load HSK dictionary.</p>';
+                return;
+            }
+        } catch (err) {
+            console.error('Error loading HSK dictionary:', err);
+            const grid = document.getElementById('vocab-tracker-grid');
+            if (grid) grid.innerHTML = '<p style="color: var(--text-secondary); text-align: center;">Error loading dictionary.</p>';
+            return;
+        }
+    }
+    renderVocabGrid();
+}
+
+// Render the GitHub-style vocab grid grouped by HSK level
+function renderVocabGrid() {
+    const gridContainer = document.getElementById('vocab-tracker-grid');
+    const statsEl = document.getElementById('vocab-tracker-stats');
+    if (!gridContainer) return;
+
+    gridContainer.innerHTML = '';
+
+    // Group words by HSK level (only levels 1-6)
+    const levels = {};
+    let totalWords = 0;
+    let totalSeen = 0;
+
+    for (const [word, level] of Object.entries(allHskWords)) {
+        if (level < 1 || level > 6) continue; // Skip level 7 (above HSK 6)
+        if (!levels[level]) levels[level] = [];
+        levels[level].push(word);
+        totalWords++;
+        if (seenVocab[word] && seenVocab[word] > 0) totalSeen++;
+    }
+
+    // Update stats
+    if (statsEl) {
+        statsEl.textContent = `${totalSeen} / ${totalWords} words seen`;
+    }
+
+    // Render each level section
+    const sortedLevels = Object.keys(levels).sort((a, b) => Number(a) - Number(b));
+
+    for (const level of sortedLevels) {
+        const words = levels[level].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+        const seenCount = words.filter(w => seenVocab[w] && seenVocab[w] > 0).length;
+
+        const section = document.createElement('div');
+        section.className = 'vocab-level-section';
+
+        // Level header with progress bar
+        const header = document.createElement('div');
+        header.className = 'vocab-level-header';
+        const pct = words.length > 0 ? Math.round((seenCount / words.length) * 100) : 0;
+        header.innerHTML = `
+            <span class="vocab-level-label">HSK ${level}</span>
+            <div class="vocab-level-bar"><div style="width: ${pct}%;"></div></div>
+            <span class="vocab-level-count">${seenCount}/${words.length}</span>
+        `;
+        section.appendChild(header);
+
+        // Grid of cells
+        const grid = document.createElement('div');
+        grid.className = 'vocab-grid';
+
+        for (const word of words) {
+            const count = seenVocab[word] || 0;
+            const cell = document.createElement('div');
+            cell.className = 'vocab-cell';
+
+            // Length-based font sizing so the word fits inside the box
+            const len = [...word].length;
+            if (len === 1) cell.classList.add('len-1');
+            else if (len === 2) cell.classList.add('len-2');
+            else if (len === 3) cell.classList.add('len-3');
+            else if (len === 4) cell.classList.add('len-4');
+            else cell.classList.add('len-many');
+
+            // Color intensity based on count
+            if (count >= 10) cell.classList.add('seen-4');
+            else if (count >= 5) cell.classList.add('seen-3');
+            else if (count >= 2) cell.classList.add('seen-2');
+            else if (count >= 1) cell.classList.add('seen-1');
+
+            // Character visible inside the cell
+            const charLabel = document.createElement('span');
+            charLabel.className = 'vocab-cell-char';
+            charLabel.textContent = word;
+            cell.appendChild(charLabel);
+
+            // Tooltip: enlarged char + pinyin (lazy) + count
+            const tooltip = document.createElement('div');
+            tooltip.className = 'vocab-cell-tooltip';
+            const cachedPinyin = pinyinCache[word];
+            const pinyinClass = cachedPinyin ? 'tooltip-pinyin' : 'tooltip-pinyin loading';
+            const pinyinText = cachedPinyin || '…';
+            tooltip.innerHTML = `
+                <span class="tooltip-char">${word}</span>
+                <span class="${pinyinClass}" data-word="${word}">${pinyinText}</span>
+                <span class="tooltip-count">Seen ${count} time${count !== 1 ? 's' : ''}</span>
+            `;
+            cell.appendChild(tooltip);
+
+            // Lazy-load pinyin on first hover
+            cell.addEventListener('mouseenter', () => ensurePinyin(word, tooltip));
+
+            // Click → show context modal
+            cell.addEventListener('click', () => showVocabContextModal(word, count));
+
+            grid.appendChild(cell);
+        }
+
+        section.appendChild(grid);
+        gridContainer.appendChild(section);
+    }
+}
+
+// Lazy-load pinyin for a word and update the hover tooltip in-place
+async function ensurePinyin(word, tooltipEl) {
+    if (pinyinCache[word]) return;
+    try {
+        const result = await window.electronAPI.getPinyin(word);
+        if (result && result.success && result.pinyin) {
+            pinyinCache[word] = result.pinyin;
+            try { localStorage.setItem('pinyinCache', JSON.stringify(pinyinCache)); } catch (e) { /* quota */ }
+            const span = tooltipEl && tooltipEl.querySelector(`.tooltip-pinyin[data-word="${word}"]`);
+            if (span) {
+                span.textContent = result.pinyin;
+                span.classList.remove('loading');
+            }
+        }
+    } catch (err) {
+        console.error('Pinyin fetch failed for', word, err);
+    }
+}
+
+// Show the vocab context modal for a clicked word
+async function showVocabContextModal(word, count) {
+    const modal = document.getElementById('vocab-context-modal');
+    const wordEl = document.getElementById('vocab-context-word');
+    const loading = document.getElementById('vocab-context-loading');
+    const textEl = document.getElementById('vocab-context-text');
+    const errorEl = document.getElementById('vocab-context-error');
+
+    if (!modal) return;
+
+    wordEl.textContent = `${word}  (Seen ${count} time${count !== 1 ? 's' : ''})`;
+    modal.style.display = 'flex';
+    loading.style.display = 'flex';
+    textEl.style.display = 'none';
+    errorEl.style.display = 'none';
+
+    // Close handlers
+    document.getElementById('vocab-context-close').onclick = () => { modal.style.display = 'none'; };
+    document.querySelector('.vocab-context-overlay').onclick = () => { modal.style.display = 'none'; };
+
+    // Check cache first
+    if (vocabContextCache[word]) {
+        textEl.textContent = vocabContextCache[word];
+        loading.style.display = 'none';
+        textEl.style.display = 'block';
+        return;
+    }
+
+    try {
+        const result = await window.electronAPI.generateVocabContext(word);
+        if (result.success && result.context) {
+            vocabContextCache[word] = result.context;
+            textEl.textContent = result.context;
+            loading.style.display = 'none';
+            textEl.style.display = 'block';
+        } else {
+            throw new Error(result.error || 'No context received');
+        }
+    } catch (err) {
+        console.error('Error generating vocab context:', err);
+        loading.style.display = 'none';
+        errorEl.style.display = 'block';
+        errorEl.textContent = `Error: ${err.message || 'Failed to generate context.'}`;
+    }
 }

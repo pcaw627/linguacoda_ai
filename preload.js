@@ -1,13 +1,22 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  // Zoom
+  zoomIn: () => ipcRenderer.invoke('zoom-in'),
+  zoomOut: () => ipcRenderer.invoke('zoom-out'),
+  zoomReset: () => ipcRenderer.invoke('zoom-reset'),
+
   getConfig: () => ipcRenderer.invoke('get-config'),
   startCapture: (deviceId, deviceType) => ipcRenderer.invoke('start-capture', deviceId, deviceType),
   stopCapture: () => ipcRenderer.invoke('stop-capture'),
   getAudioDevices: (forceRefresh = false) => ipcRenderer.invoke('get-audio-devices', forceRefresh),
   saveDeviceSelection: (deviceId, deviceType) => ipcRenderer.invoke('save-device-selection', deviceId, deviceType),
   translateText: (text) => ipcRenderer.invoke('translate-text', text),
+  extractSemanticUnits: (transcription, translation) => ipcRenderer.invoke('extract-semantic-units', transcription, translation),
   setVolumeThreshold: (threshold) => ipcRenderer.invoke('set-volume-threshold', threshold),
+  getHskDictionary: () => ipcRenderer.invoke('get-hsk-dictionary'),
+  getPinyin: (text) => ipcRenderer.invoke('get-pinyin', text),
+  generateVocabContext: (word) => ipcRenderer.invoke('generate-vocab-context', word),
   windowMinimize: () => ipcRenderer.invoke('window-minimize'),
   windowMaximize: () => ipcRenderer.invoke('window-maximize'),
   windowClose: () => ipcRenderer.invoke('window-close'),
