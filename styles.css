@@ -696,6 +696,7 @@ body {
 }
 
 .detail-card {
+    position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -717,6 +718,7 @@ body {
     border-color: var(--accent);
     transform: translateY(-2px);
     box-shadow: 0 4px 12px rgba(74, 158, 255, 0.3);
+    z-index: 100;
 }
 
 .detail-card.highlighted {
@@ -724,6 +726,70 @@ body {
     border-color: var(--accent);
     color: var(--accent);
     box-shadow: 0 4px 12px rgba(74, 158, 255, 0.4);
+}
+
+/* Pinyin tooltip on hover — shows each character with its pinyin syllable below.
+   Rendered as a body-level, position:fixed popover so it isn't clipped by the modal's
+   overflow/scroll containers (or by transforms on the card itself). Position and
+   show/hide are controlled by JS in renderer.js. */
+.detail-card-tooltip {
+    position: fixed;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: var(--text-primary);
+    z-index: 2000;
+    pointer-events: none;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6);
+    white-space: nowrap;
+}
+
+.detail-card-tt-row {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 8px;
+    justify-content: center;
+}
+
+.detail-card-tt-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 1.6em;
+}
+
+.detail-card-tt-char {
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1.1;
+    color: var(--text-primary);
+}
+
+.detail-card-tt-pinyin {
+    font-size: 12px;
+    line-height: 1.2;
+    color: var(--accent);
+    font-style: italic;
+    letter-spacing: 0.3px;
+    margin-top: 2px;
+}
+
+.detail-card-tt-pinyin.loading {
+    color: var(--text-secondary);
+    font-style: normal;
+    opacity: 0.6;
+}
+
+.detail-card-tt-pinyin-full {
+    font-size: 12px;
+    color: var(--accent);
+    font-style: italic;
+    text-align: center;
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px solid var(--border);
 }
 
 .detail-error {

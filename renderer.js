@@ -884,12 +884,14 @@ async function showDetailView(pairIndex) {
     // Setup close button
     document.getElementById('detail-view-close').onclick = () => {
         modal.style.display = 'none';
+        hideDetailCardTooltip();
     };
     
     // Close on overlay click
     document.querySelector('.detail-modal-overlay').onclick = (e) => {
         if (e.target.classList.contains('detail-modal-overlay')) {
             modal.style.display = 'none';
+            hideDetailCardTooltip();
         }
     };
     
@@ -1008,9 +1010,19 @@ function renderChunksAsCards(container, fullText, segments, type) {
         // The card itself
         const card = document.createElement('span');
         card.className = 'detail-card';
-        card.textContent = segment.text;
         card.dataset.type = type;
         card.dataset.chunkId = segment.chunkId;
+
+        // Card visible text (kept as its own element so the tooltip child doesn't
+        // bleed into the layout)
+        const labelEl = document.createElement('span');
+        labelEl.className = 'detail-card-label';
+        labelEl.textContent = segment.text;
+        card.appendChild(labelEl);
+
+        // For Chinese chunks, attach a hover tooltip that shows pinyin under each char
+        attachDetailCardPinyinTooltip(card, segment.text);
+
         container.appendChild(card);
         
         currentPos = segment.end;
@@ -1019,6 +1031,140 @@ function renderChunksAsCards(container, fullText, segments, type) {
     // Trailing text after last card
     if (currentPos < fullText.length) {
         container.appendChild(document.createTextNode(fullText.substring(currentPos)));
+    }
+}
+
+// Shared, body-attached tooltip element. Lives outside the detail modal so it isn't
+// clipped by the modal's scrolling/overflow:hidden containers, and so it isn't affected
+// by transforms on .detail-card:hover (which would otherwise establish a containing block
+// even for position:fixed children).
+let detailCardTooltipEl = null;
+function getDetailCardTooltip() {
+    if (!detailCardTooltipEl) {
+        detailCardTooltipEl = document.createElement('div');
+        detailCardTooltipEl.className = 'detail-card-tooltip';
+        detailCardTooltipEl.style.display = 'none';
+        document.body.appendChild(detailCardTooltipEl);
+    }
+    return detailCardTooltipEl;
+}
+
+function hideDetailCardTooltip() {
+    if (detailCardTooltipEl) {
+        detailCardTooltipEl.style.display = 'none';
+        detailCardTooltipEl.dataset.activeKey = '';
+    }
+}
+
+// Attach hover handlers to show a pinyin tooltip for the chunk under the cursor.
+// Skips chunks with no Chinese characters. Pinyin comes from the same IPC + cache as the vocab tracker.
+function attachDetailCardPinyinTooltip(card, text) {
+    if (!text || !/[\u4e00-\u9fff]/.test(text)) return;
+
+    const chars = [...text];
+
+    card.addEventListener('mouseenter', () => {
+        const tooltip = getDetailCardTooltip();
+        tooltip.dataset.activeKey = text;
+        renderDetailCardTooltipContent(tooltip, chars, pinyinCache[text]);
+        tooltip.style.display = 'block';
+        positionDetailCardTooltip(tooltip, card);
+
+        // Lazy-load pinyin on first hover; only update if still hovering the same card
+        if (!pinyinCache[text]) {
+            (async () => {
+                try {
+                    const result = await window.electronAPI.getPinyin(text);
+                    if (result && result.success && result.pinyin) {
+                        pinyinCache[text] = result.pinyin;
+                        try { localStorage.setItem('pinyinCache', JSON.stringify(pinyinCache)); } catch (e) { /* quota */ }
+                        if (detailCardTooltipEl && detailCardTooltipEl.dataset.activeKey === text) {
+                            renderDetailCardTooltipContent(detailCardTooltipEl, chars, result.pinyin);
+                            positionDetailCardTooltip(detailCardTooltipEl, card);
+                        }
+                    }
+                } catch (err) {
+                    console.error('Pinyin fetch failed for detail card', text, err);
+                }
+            })();
+        }
+    });
+
+    card.addEventListener('mouseleave', () => {
+        if (detailCardTooltipEl && detailCardTooltipEl.dataset.activeKey === text) {
+            hideDetailCardTooltip();
+        }
+    });
+}
+
+// Position the (fixed) tooltip below the card, flipping above if there's no room below.
+// Clamps horizontally so the tooltip stays inside the viewport.
+function positionDetailCardTooltip(tooltip, card) {
+    const cardRect = card.getBoundingClientRect();
+    // Reset so we can measure natural size
+    tooltip.style.left = '0px';
+    tooltip.style.top = '0px';
+    const ttRect = tooltip.getBoundingClientRect();
+    const vh = window.innerHeight;
+    const vw = window.innerWidth;
+    const margin = 8;
+
+    let top = cardRect.bottom + margin;
+    if (top + ttRect.height > vh - margin) {
+        const above = cardRect.top - ttRect.height - margin;
+        if (above >= margin) top = above;
+    }
+    if (top < margin) top = margin;
+
+    let left = cardRect.left + cardRect.width / 2 - ttRect.width / 2;
+    if (left < margin) left = margin;
+    if (left + ttRect.width > vw - margin) left = vw - ttRect.width - margin;
+
+    tooltip.style.top = `${top}px`;
+    tooltip.style.left = `${left}px`;
+}
+
+// (Re)render the contents of a detail-card tooltip. If pinyin syllables align 1:1
+// with characters, show pinyin under each char. Otherwise fall back to showing the
+// whole pinyin string under the row of characters.
+function renderDetailCardTooltipContent(tooltip, chars, pinyinString) {
+    tooltip.innerHTML = '';
+    const loaded = !!pinyinString;
+    const parts = loaded ? pinyinString.split(/\s+/).filter(Boolean) : [];
+    const aligned = loaded && parts.length === chars.length;
+
+    const row = document.createElement('div');
+    row.className = 'detail-card-tt-row';
+    chars.forEach((ch, i) => {
+        const col = document.createElement('div');
+        col.className = 'detail-card-tt-col';
+
+        const charEl = document.createElement('span');
+        charEl.className = 'detail-card-tt-char';
+        charEl.textContent = ch;
+        col.appendChild(charEl);
+
+        if (aligned) {
+            const pinyinEl = document.createElement('span');
+            pinyinEl.className = 'detail-card-tt-pinyin';
+            pinyinEl.textContent = parts[i];
+            col.appendChild(pinyinEl);
+        } else if (!loaded) {
+            const pinyinEl = document.createElement('span');
+            pinyinEl.className = 'detail-card-tt-pinyin loading';
+            pinyinEl.textContent = '…';
+            col.appendChild(pinyinEl);
+        }
+
+        row.appendChild(col);
+    });
+    tooltip.appendChild(row);
+
+    if (loaded && !aligned) {
+        const full = document.createElement('div');
+        full.className = 'detail-card-tt-pinyin-full';
+        full.textContent = pinyinString;
+        tooltip.appendChild(full);
     }
 }
 
