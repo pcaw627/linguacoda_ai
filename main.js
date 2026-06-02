@@ -27,6 +27,91 @@ let pythonBackend = null;
 let transcriptionServer = null;
 const config = require('./electron-config.json');
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Waiting-for-audio ping-pong animation
+//
+// The Python audio backend signals (via a JSON message on stdout) when it
+// starts/stops seeing only silent buffers. While in that state we render a
+// single-line ping-pong animation in the Electron main-process console so the
+// user can tell the app is alive without scrollback being flooded by repeated
+// "Buffer volume too low, skipping transcription" messages.
+// ─────────────────────────────────────────────────────────────────────────────
+const PING_PONG_TRACK_WIDTH = 14;
+const PING_PONG_FRAME_MS = 80;
+const WAITING_LABEL = '[AudioBackend] Waiting for audio activity...';
+
+let waitingAnimationInterval = null;
+let waitingAnimationActive = false;
+let pingPongPos = 0;
+let pingPongDir = 1;
+let soundcardDiscontinuityWarningShown = false;
+
+function clearWaitingLine() {
+  // \r to start of line, blank out, \r again so the next write starts at col 0.
+  // Do this even when Node doesn't report a TTY; Electron-launched processes in
+  // Cursor/PowerShell can still render carriage-return updates correctly.
+  const width = (process.stdout.columns || 120);
+  process.stdout.write('\r' + ' '.repeat(Math.max(1, width - 1)) + '\r');
+}
+
+function renderPingPongTrack(pos) {
+  let track = '';
+  for (let i = 0; i < PING_PONG_TRACK_WIDTH; i++) {
+    track += i === pos ? 'o' : '-';
+  }
+  return `[${track}]`;
+}
+
+function startWaitingForAudioAnimation() {
+  if (waitingAnimationActive) return;
+  waitingAnimationActive = true;
+
+  pingPongPos = 0;
+  pingPongDir = 1;
+  waitingAnimationInterval = setInterval(() => {
+    process.stdout.write(`\r${WAITING_LABEL} ${renderPingPongTrack(pingPongPos)}`);
+    pingPongPos += pingPongDir;
+    if (pingPongPos >= PING_PONG_TRACK_WIDTH - 1) {
+      pingPongPos = PING_PONG_TRACK_WIDTH - 1;
+      pingPongDir = -1;
+    } else if (pingPongPos <= 0) {
+      pingPongPos = 0;
+      pingPongDir = 1;
+    }
+  }, PING_PONG_FRAME_MS);
+}
+
+function stopWaitingForAudioAnimation() {
+  if (!waitingAnimationActive) return;
+  waitingAnimationActive = false;
+  if (waitingAnimationInterval) {
+    clearInterval(waitingAnimationInterval);
+    waitingAnimationInterval = null;
+  }
+  clearWaitingLine();
+}
+
+// Wrap console methods so other log lines (from the transcription server,
+// IPC handlers, etc.) don't get clobbered by — or clobber — the animation.
+// Each wrapped call clears the animation line, prints, and lets the next
+// animation tick re-render the line.
+const _origConsoleLog = console.log.bind(console);
+const _origConsoleError = console.error.bind(console);
+const _origConsoleWarn = console.warn.bind(console);
+
+console.log = (...args) => {
+  if (waitingAnimationActive) clearWaitingLine();
+  _origConsoleLog(...args);
+};
+console.error = (...args) => {
+  if (waitingAnimationActive) clearWaitingLine();
+  _origConsoleError(...args);
+};
+console.warn = (...args) => {
+  if (waitingAnimationActive) clearWaitingLine();
+  _origConsoleWarn(...args);
+};
+
 // Create the main window
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -224,6 +309,17 @@ function startPythonBackend() {
             mainWindow.webContents.send('audio-devices', json.data);
           } else if (json.type === 'status') {
             // Status updates
+          } else if (json.type === 'log') {
+            // Routine audio-backend log lines — label them so they're
+            // visually distinct from the generic stderr 'Python Error:'
+            // stream and from the transcription server's own logs.
+            console.log(`[AudioBackend] ${json.data}`);
+          } else if (json.type === 'waiting-for-audio') {
+            if (json.data === true) {
+              startWaitingForAudioAnimation();
+            } else {
+              stopWaitingForAudioAnimation();
+            }
           }
         } catch (e) {
           // Not JSON, might be regular print output
@@ -236,10 +332,19 @@ function startPythonBackend() {
   });
 
   pythonBackend.stderr.on('data', (data) => {
-    console.error('Python Error:', data.toString());
+    const message = data.toString();
+    if (message.includes('SoundcardRuntimeWarning: data discontinuity in recording')) {
+      if (!soundcardDiscontinuityWarningShown) {
+        soundcardDiscontinuityWarningShown = true;
+        console.warn('[AudioBackend] Soundcard warning: audio capture reported a brief data discontinuity; continuing capture.');
+      }
+      return;
+    }
+    console.error('Python Error:', message);
   });
 
   pythonBackend.on('close', (code) => {
+    stopWaitingForAudioAnimation();
     console.log(`Python backend exited with code ${code}`);
   });
 }

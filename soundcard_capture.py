@@ -15,12 +15,21 @@ from __future__ import annotations
 
 import sys
 import threading
+import warnings
 from typing import Callable, List, Dict, Any, Optional
 
 import numpy as np
 import soundcard as sc
+from soundcard.mediafoundation import SoundcardRuntimeWarning
 
 import config
+
+
+warnings.filterwarnings(
+    "ignore",
+    message="data discontinuity in recording",
+    category=SoundcardRuntimeWarning,
+)
 
 
 _COINIT_MULTITHREADED = 0x0

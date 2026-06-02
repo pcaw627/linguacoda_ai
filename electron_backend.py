@@ -47,7 +47,13 @@ class ElectronBackend:
         # Silence detection tracking
         self.silence_start_time = None
         self.buffer_start_time = None
-        
+
+        # Whether the Electron console is currently showing the
+        # "Waiting for audio activity..." animation. While this is True we
+        # suppress the routine silence/skip log lines that would otherwise
+        # spam the console every ~0.5s.
+        self._in_silence_mode = False
+
         # Transcriber client will connect to external server
         self.transcriber = None
         self._transcriber_initializing = False
@@ -111,6 +117,28 @@ class ElectronBackend:
     def _send_error(self, error):
         """Send error message"""
         self._send_message("error", error)
+
+    def _send_log(self, message):
+        """Send a structured log line to Electron's main-process console.
+
+        These appear with an [AudioBackend] label instead of being mixed in
+        with the generic 'Python Error:' stderr stream.
+        """
+        self._send_message("log", message)
+
+    def _enter_silence_mode(self):
+        """Signal the Electron console to start the waiting-for-audio
+        animation. Idempotent across consecutive silent buffers."""
+        if not self._in_silence_mode:
+            self._in_silence_mode = True
+            self._send_message("waiting-for-audio", True)
+
+    def _exit_silence_mode(self):
+        """Signal the Electron console to stop the waiting-for-audio
+        animation. Idempotent."""
+        if self._in_silence_mode:
+            self._in_silence_mode = False
+            self._send_message("waiting-for-audio", False)
     
     def _calculate_volume(self, audio_data):
         """Calculate RMS amplitude"""
@@ -139,8 +167,9 @@ class ElectronBackend:
         # Initialize buffer start time on first chunk
         if self.buffer_start_time is None:
             self.buffer_start_time = current_time
-            print(f"Started audio buffering at {current_time}", file=sys.stderr)
-        
+            if not self._in_silence_mode:
+                self._send_log(f"Started audio buffering at {current_time}")
+
         # Add chunk to buffer
         self.audio_buffer.append(audio_chunk)
         
@@ -149,7 +178,8 @@ class ElectronBackend:
         
         # Check if we've exceeded max duration
         if buffer_length >= self.buffer_max_duration:
-            print(f"Buffer max duration reached ({buffer_length:.2f}s), processing...", file=sys.stderr)
+            if not self._in_silence_mode:
+                self._send_log(f"Buffer max duration reached ({buffer_length:.2f}s), processing...")
             # Copy buffer before processing to avoid race conditions
             buffer_to_process = list(self.audio_buffer)
             # Force process buffer
@@ -170,7 +200,8 @@ class ElectronBackend:
                 # Check if we've had enough silence
                 silence_duration = current_time - self.silence_start_time
                 if silence_duration >= self.buffer_silence_duration:
-                    print(f"Silence detected ({silence_duration:.2f}s), processing buffer ({buffer_length:.2f}s, {len(self.audio_buffer)} chunks)...", file=sys.stderr)
+                    if not self._in_silence_mode:
+                        self._send_log(f"Silence detected ({silence_duration:.2f}s), processing buffer ({buffer_length:.2f}s, {len(self.audio_buffer)} chunks)...")
                     # Copy buffer before processing to avoid race conditions
                     buffer_to_process = list(self.audio_buffer)
                     # Process buffer after silence period
@@ -182,7 +213,11 @@ class ElectronBackend:
         else:
             # Volume is above threshold - reset silence tracking
             if self.silence_start_time is not None:
-                print(f"Audio detected (volume={volume:.6f}), resetting silence tracking", file=sys.stderr)
+                # Audio came in after a quiet stretch — stop the waiting
+                # animation right away so the user gets immediate feedback,
+                # even before transcription completes.
+                self._exit_silence_mode()
+                self._send_log(f"Audio detected (volume={volume:.6f}), resetting silence tracking")
             self.silence_start_time = None
     
     def _process_audio_buffer(self, buffer_to_process=None):
@@ -194,85 +229,96 @@ class ElectronBackend:
         # Use provided buffer or current buffer
         if buffer_to_process is None:
             buffer_to_process = self.audio_buffer
-        
+
         if not buffer_to_process:
-            print("Process audio buffer called but buffer is empty", file=sys.stderr)
+            if not self._in_silence_mode:
+                self._send_log("Process audio buffer called but buffer is empty")
             return
-        
+
         try:
-            print(f"Processing audio buffer: {len(buffer_to_process)} chunks", file=sys.stderr)
             audio_data = np.concatenate(buffer_to_process)
             buffer_duration = len(audio_data) / config.SAMPLE_RATE
-            print(f"Concatenated audio: {len(audio_data)} samples, {buffer_duration:.2f}s", file=sys.stderr)
-            
-            # Check volume threshold (skip if entire buffer is too quiet)
+
+            # Check volume threshold (skip if entire buffer is too quiet).
+            # We check this *before* logging anything so that consecutive
+            # silent buffers don't spam the console — we only print the
+            # silence message once (when entering silence mode).
             volume = self._calculate_volume(audio_data)
-            print(f"Buffer volume: {volume:.6f}, threshold: {self.volume_threshold:.6f}", file=sys.stderr)
             if volume <= self.volume_threshold:
-                print(f"Buffer volume too low ({volume:.6f} <= {self.volume_threshold:.6f}), skipping transcription", file=sys.stderr)
+                self._enter_silence_mode()
                 return
-            
+
+            # Real audio in this buffer — stop the waiting animation
+            # (no-op if it wasn't running) and resume normal logging.
+            self._exit_silence_mode()
+
+            self._send_log(
+                f"Processing audio buffer: {len(buffer_to_process)} chunks "
+                f"({len(audio_data)} samples, {buffer_duration:.2f}s, "
+                f"volume={volume:.6f}, threshold={self.volume_threshold:.6f})"
+            )
+
             # Initialize transcriber client if needed (wait for completion if already initializing)
             if self.transcriber is None:
-                print("Transcriber client not initialized, initializing now...", file=sys.stderr)
+                self._send_log("Transcriber client not initialized, initializing now...")
                 self._init_transcriber(wait_for_completion=True)
-            
+
             # Check if transcriber was successfully initialized
             if not self.transcriber:
-                print("Transcriber client is None after initialization attempt, cannot transcribe", file=sys.stderr)
+                self._send_log("Transcriber client is None after initialization attempt, cannot transcribe")
                 return
-            
+
             # Check if server is running and ready
             if not self.transcriber.is_server_running():
-                print("Transcription server is not running, skipping transcription", file=sys.stderr)
+                self._send_log("Transcription server is not running, skipping transcription")
                 return
-            
+
             if not self.transcriber.is_ready():
-                print("Transcription server not ready yet, waiting...", file=sys.stderr)
+                self._send_log("Transcription server not ready yet, waiting...")
                 # Wait a bit for server to be ready
                 import time as time_module
                 for _ in range(10):  # Wait up to 1 second
                     time_module.sleep(0.1)
                     if self.transcriber.is_ready():
                         break
-                
+
                 if not self.transcriber.is_ready():
-                    print("Transcription server still not ready after waiting", file=sys.stderr)
+                    self._send_log("Transcription server still not ready after waiting")
                     return
-            
+
             # Transcribe
-            print(f"Calling transcriber with {len(audio_data)} samples, language: {self.selected_language}", file=sys.stderr)
+            self._send_log(f"Calling transcriber with {len(audio_data)} samples, language: {self.selected_language}")
             transcription_lang = self.selected_language if self.selected_language != "auto" else "auto"
             transcription, detected_lang = self.transcriber.transcribe(audio_data, transcription_lang)
-            
-            print(f"Transcription result: '{transcription}', detected_lang: {detected_lang}", file=sys.stderr)
-            
+
+            self._send_log(f"Transcription result: '{transcription}', detected_lang: {detected_lang}")
+
             if transcription and transcription.strip() and "_" not in transcription:
                 # Handle language detection
                 if self.selected_language == "auto" and detected_lang and detected_lang != "auto" and detected_lang != "unknown":
                     self.language_history.append(detected_lang)
                     if len(self.language_history) > config.LANGUAGE_JITTER_WINDOW:
                         self.language_history.pop(0)
-                    
+
                     if len(self.language_history) >= config.LANGUAGE_JITTER_WINDOW:
                         last_n = self.language_history[-config.LANGUAGE_JITTER_WINDOW:]
                         if len(set(last_n)) == 1:
                             new_lang = last_n[0]
                             if new_lang != self.current_detected_language:
                                 self.current_detected_language = new_lang
-                
-                print(f"Sending transcription to UI: '{transcription.strip()}'", file=sys.stderr)
+
+                self._send_log(f"Sending transcription to UI: '{transcription.strip()}'")
                 self._send_message("transcription", {
                     "transcription": transcription.strip(),
                     "detectedLang": detected_lang if detected_lang else self.current_detected_language
                 })
             else:
                 if not transcription:
-                    print("Transcription is empty", file=sys.stderr)
+                    self._send_log("Transcription is empty")
                 elif not transcription.strip():
-                    print("Transcription is only whitespace", file=sys.stderr)
+                    self._send_log("Transcription is only whitespace")
                 elif "_" in transcription:
-                    print(f"Transcription contains '_' (likely error): '{transcription}'", file=sys.stderr)
+                    self._send_log(f"Transcription contains '_' (likely error): '{transcription}'")
         except Exception as e:
             import traceback
             print(f"Error processing audio: {e}", file=sys.stderr)
@@ -431,6 +477,9 @@ class ElectronBackend:
         self.audio_buffer = []
         self.buffer_start_time = None
         self.silence_start_time = None
+        # Make sure the waiting-for-audio animation doesn't keep spinning
+        # in the Electron console after the user stops capture.
+        self._exit_silence_mode()
         self._send_message("status", "stopped")
     
     def get_audio_devices(self, use_cache: bool = True, force_refresh: bool = False):
