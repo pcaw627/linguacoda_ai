@@ -418,119 +418,83 @@ ipcMain.handle('translate-text', async (event, text) => {
   }
 });
 
-// --- Helpers for semantic unit extraction ---
+// --- Semantic unit alignment (SimAlign via transcription server) ---
 
-async function callOllama(prompt) {
-  const response = await axios.post(`${config.ollamaEndpoint}/api/generate`, {
-    model: config.ollamaModel,
-    prompt: prompt,
-    stream: false
-  });
-  if (response.data && response.data.response) {
-    return response.data.response.trim();
-  }
-  throw new Error('No response from Ollama');
+const TRANSCRIPTION_SERVER_URL = 'http://127.0.0.1:8765';
+const TRANSCRIPTION_SERVER_TOKEN_FILE = path.join(__dirname, '.transcription_server.token');
+// First /align after a cold start can block on XLM-R load; allow plenty of time.
+const ALIGN_REQUEST_TIMEOUT_MS = 120000;
+
+function loadTranscriptionServerToken() {
+  try {
+    if (fs.existsSync(TRANSCRIPTION_SERVER_TOKEN_FILE)) {
+      const token = fs.readFileSync(TRANSCRIPTION_SERVER_TOKEN_FILE, 'utf8').trim();
+      if (token) return token;
+    }
+  } catch (e) { /* ignore */ }
+  return null;
 }
 
-function extractJsonFromLLM(text) {
-  let jsonText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-  const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
-  if (jsonMatch) {
-    return JSON.parse(jsonMatch[0]);
+function formatAlignError(error) {
+  if (error.code === 'ECONNREFUSED') {
+    return 'Transcription/alignment server is not running. Restart the app and try again.';
   }
-  throw new Error('No valid JSON found in LLM response');
+  if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+    return 'Alignment request timed out (the SimAlign model may still be loading). Try again in a moment.';
+  }
+  if (error.response) {
+    const body = error.response.data;
+    const detail = (body && (body.error || body.message)) || error.response.statusText;
+    return `Alignment server returned HTTP ${error.response.status}: ${detail || 'request failed'}`;
+  }
+  return error.message || 'Alignment request failed';
 }
-
-// --- Semantic unit extraction: tokenize → correlate with retry ---
 
 ipcMain.handle('extract-semantic-units', async (event, transcription, translation) => {
   try {
-    // ── Phase 1: Tokenize both sentences into meaningful chunks with unique IDs ──
-    const tokenizePrompt = `Tokenize these two sentences into meaningful chunks. Each chunk should represent a single distinct meaning that could be individually translated as a word or short phrase (e.g., "book", "on time", "have been").
-
-Rules:
-- Assign unique IDs: "t1", "t2", ... for Sentence 1 and "e1", "e2", ... for Sentence 2
-- Each occurrence of a repeated word must be a SEPARATE chunk with its own unique ID
-- Do NOT include parenthetical clarifiers or tags like "(referring to X)" as part of any chunk — strip them out entirely
-- Chunks must be in sentence order and should cover all meaningful content
-- Output ONLY valid JSON, no other text
-
-Sentence 1: ${transcription}
-Sentence 2: ${translation}
-
-Required JSON format:
-{"sentence1": [{"id": "t1", "text": "..."}, {"id": "t2", "text": "..."}], "sentence2": [{"id": "e1", "text": "..."}, {"id": "e2", "text": "..."}]}`;
-
-    console.log('[SemanticUnits] Phase 1 — tokenizing…');
-    const tokenResponse = await callOllama(tokenizePrompt);
-    const tokenData = extractJsonFromLLM(tokenResponse);
-
-    const transcriptionChunks = tokenData.sentence1 || [];
-    const translationChunks  = tokenData.sentence2 || [];
-
-    if (transcriptionChunks.length === 0 || translationChunks.length === 0) {
-      throw new Error('Tokenization returned empty chunks');
+    const token = loadTranscriptionServerToken();
+    if (!token) {
+      return {
+        success: false,
+        error: 'Alignment server token not found. Wait for the transcription server to finish starting, then try again.'
+      };
     }
 
-    console.log(`[SemanticUnits] Tokenized: ${transcriptionChunks.length} transcription chunks, ${translationChunks.length} translation chunks`);
-
-    // ── Phase 2: Correlate chunks (with retry for uncovered IDs) ──
-    const allTranscriptionIds = transcriptionChunks.map(c => c.id);
-    let correlations = [];
-    let attemptedIds = new Set();
-    const MAX_RETRIES = 3;
-
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const uncorrelatedIds = allTranscriptionIds.filter(id => !attemptedIds.has(id));
-      if (uncorrelatedIds.length === 0) break;
-
-      const isRetry = attempt > 0;
-      const focusClause = isRetry
-        ? `\nIMPORTANT: The following Sentence 1 chunk IDs were NOT included in your previous response. You MUST provide a correlation entry (with a match or null) for each of these IDs: ${uncorrelatedIds.join(', ')}`
-        : '';
-
-      const correlatePrompt = `Given these tokenized chunks from two sentences that are translations of each other, find the meaning correlation between chunks.
-
-Sentence 1 chunks: ${JSON.stringify(transcriptionChunks)}
-Sentence 2 chunks: ${JSON.stringify(translationChunks)}${focusClause}
-
-Rules:
-- For EVERY Sentence 1 chunk, provide the ID of the best-matching Sentence 2 chunk, or null if there is no equivalent
-- Every Sentence 1 chunk ID must appear exactly once in your response
-- If a word appears multiple times, each occurrence (with its own unique ID) may map to a different Sentence 2 chunk
-- Output ONLY valid JSON, no other text
-
-Required JSON format:
-{"correlations": [{"id": "t1", "match": "e1"}, {"id": "t2", "match": null}]}`;
-
-      console.log(`[SemanticUnits] Phase 2 — correlation attempt ${attempt + 1}, ${uncorrelatedIds.length} IDs remaining…`);
-      const correlateResponse = await callOllama(correlatePrompt);
-      const correlateData = extractJsonFromLLM(correlateResponse);
-      const newCorrelations = correlateData.correlations || [];
-
-      for (const corr of newCorrelations) {
-        if (corr && corr.id && !attemptedIds.has(corr.id)) {
-          attemptedIds.add(corr.id);
-          correlations.push(corr);
-        }
+    console.log('[SemanticUnits] Aligning via SimAlign (pkuseg + XLM-R)…');
+    const response = await axios.post(
+      `${TRANSCRIPTION_SERVER_URL}/align`,
+      { transcription, translation },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: ALIGN_REQUEST_TIMEOUT_MS
       }
+    );
 
-      console.log(`[SemanticUnits] After attempt ${attempt + 1}: ${attemptedIds.size}/${allTranscriptionIds.length} IDs covered`);
-
-      if (allTranscriptionIds.every(id => attemptedIds.has(id))) {
-        break;
-      }
+    const data = response.data;
+    if (!data || !Array.isArray(data.transcriptionChunks) || !Array.isArray(data.translationChunks)) {
+      throw new Error('Alignment server returned an invalid response');
     }
+
+    const correlations = Array.isArray(data.correlations) ? data.correlations : [];
+    console.log(
+      `[SemanticUnits] Aligned: ${data.transcriptionChunks.length} transcription chunks, ` +
+      `${data.translationChunks.length} translation chunks, ` +
+      `${correlations.filter(c => c.matches && c.matches.length > 0).length} with matches`
+    );
 
     return {
       success: true,
-      transcriptionChunks,
-      translationChunks,
+      transcriptionChunks: data.transcriptionChunks,
+      translationChunks: data.translationChunks,
       correlations
     };
   } catch (error) {
-    console.error('Semantic unit extraction error:', error);
-    return { success: false, error: error.message };
+    const message = formatAlignError(error);
+    console.error('Semantic unit alignment error:', message);
+    return { success: false, error: message };
   }
 });
 

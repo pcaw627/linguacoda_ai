@@ -32,169 +32,151 @@
       "type": "input"
     },
     {
-      "id": 5,
-      "name": "[Microphone] Headset (I53 Hands-Free AG Audi",
-      "channels": 1,
-      "type": "input"
-    },
-    {
-      "id": 13,
+      "id": 10,
       "name": "[Microphone] Primary Sound Capture Driver",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 14,
+      "id": 11,
       "name": "[Microphone] Microphone (Logi C615 HD WebCam)",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 15,
+      "id": 12,
       "name": "[Microphone] Microphone (Steam Streaming Microphone)",
       "channels": 8,
       "type": "input"
     },
     {
-      "id": 16,
+      "id": 13,
       "name": "[Microphone] Mic/Inst (Samson G-Track Pro)",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 17,
+      "id": 14,
       "name": "[Microphone] Stereo Mix (Realtek(R) Audio)",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 18,
-      "name": "[Microphone] Headset (I53 Hands-Free AG Audio)",
-      "channels": 1,
-      "type": "input"
-    },
-    {
-      "id": 32,
+      "id": 24,
       "name": "[Microphone] Microphone (Steam Streaming Microphone)",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 33,
+      "id": 25,
       "name": "[Microphone] Mic/Inst (Samson G-Track Pro)",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 34,
+      "id": 26,
       "name": "[Microphone] Microphone (Logi C615 HD WebCam)",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 35,
+      "id": 27,
       "name": "[Microphone] Stereo Mix (Realtek(R) Audio)",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 36,
-      "name": "[Microphone] Headset (I53 Hands-Free AG Audio)",
-      "channels": 1,
-      "type": "input"
-    },
-    {
-      "id": 38,
+      "id": 29,
       "name": "[Microphone] Line In (Realtek HD Audio Line input)",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 41,
+      "id": 32,
       "name": "[Microphone] Stereo Mix (Realtek HD Audio Stereo input)",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 42,
+      "id": 33,
       "name": "[Microphone] Microphone (Realtek HD Audio Mic input)",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 45,
+      "id": 36,
       "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(soundcore Liberty 4 NC))",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 48,
+      "id": 39,
       "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(I53))",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 49,
+      "id": 40,
       "name": "[Microphone] Microphone (Steam Streaming Microphone Wave)",
       "channels": 8,
       "type": "input"
     },
     {
-      "id": 52,
+      "id": 43,
       "name": "[Microphone] Input (@System32\\drivers\\bthhfenum.sys,#4;%1 Hands-Free HF Audio%0\r\n;(Phillip's S23 Ultra))",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 55,
+      "id": 46,
       "name": "[Microphone] Input (Steam Streaming Speakers Wave)",
       "channels": 8,
       "type": "input"
     },
     {
-      "id": 60,
+      "id": 51,
       "name": "[Microphone] Mic/Inst (Samson G-Track Pro)",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 61,
+      "id": 52,
       "name": "[Microphone] Line ()",
       "channels": 2,
       "type": "input"
     },
     {
-      "id": 63,
+      "id": 54,
       "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(Indy Evo))",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 66,
+      "id": 57,
       "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(Crusher Evo))",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 67,
+      "id": 58,
       "name": "[Microphone] Microphone (Logi C615 HD WebCam)",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 69,
+      "id": 60,
       "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(Hesh Evo))",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 71,
+      "id": 62,
       "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(Soundcore Life Dot 2 NC))",
       "channels": 1,
       "type": "input"
     },
     {
-      "id": 73,
+      "id": 64,
       "name": "[Microphone] Headset (@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free AG Audio%0\r\n;(T18))",
       "channels": 1,
       "type": "input"
@@ -214,18 +196,11 @@
       "is_default": false
     },
     {
-      "id": "{0.0.0.00000000}.{6baffabf-3662-4294-9d60-89c0ae6385be}",
-      "name": "[Speaker Output] Headphones (I53 Stereo)",
-      "channels": 2,
-      "type": "output",
-      "is_default": true
-    },
-    {
       "id": "{0.0.0.00000000}.{844458bf-55e7-4217-b006-fc09841503d7}",
       "name": "[Speaker Output] Speakers (Realtek(R) Audio)",
       "channels": 2,
       "type": "output",
-      "is_default": false
+      "is_default": true
     },
     {
       "id": "{0.0.0.00000000}.{a607c894-b54d-4e37-aa7f-25d828f618d0}",
@@ -233,16 +208,9 @@
       "channels": 2,
       "type": "output",
       "is_default": false
-    },
-    {
-      "id": "{0.0.0.00000000}.{d8ca1c64-16d1-4617-83e7-31ed1d5d9e30}",
-      "name": "[Speaker Output] Headset (I53 Hands-Free AG Audio)",
-      "channels": 1,
-      "type": "output",
-      "is_default": false
     }
   ],
-  "selected_device_id": "{0.0.0.00000000}.{6baffabf-3662-4294-9d60-89c0ae6385be}",
+  "selected_device_id": "{0.0.0.00000000}.{844458bf-55e7-4217-b006-fc09841503d7}",
   "selected_device_type": "output",
-  "selected_device_name": "[Speaker Output] Headphones (I53 Stereo)"
+  "selected_device_name": "[Speaker Output] Speakers (Realtek(R) Audio)"
 }

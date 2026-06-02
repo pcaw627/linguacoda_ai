@@ -9,3 +9,25 @@ funasr>=1.0.0
 
 # Ollama API
 requests>=2.31.0
+
+# Cross-lingual semantic-unit alignment
+#   simalign   — multilingual word alignment (XLM-R + IterMax matching)
+#   transformers, torch — runtime for the XLM-R model SimAlign loads. torch is
+#                         already pulled in transitively by funasr, but pin it
+#                         here so a future funasr update can't silently break
+#                         alignment.
+simalign>=0.4
+# Keep Transformers below the releases that assume newer torch.library APIs
+# (e.g. register_fake). The SenseVoice/FunASR stack may install an older Torch
+# on Windows, and newer Transformers can fail while importing BERT/XLM-R.
+transformers>=4.20,<4.41
+sentencepiece>=0.1.99
+torch>=1.10
+
+# pkuseg — Chinese word segmentation (required by semantic_aligner.py).
+# Deliberately NOT installed by this requirements file: pkuseg's PyPI sdist
+# ships pre-generated Cython C++ that is incompatible with the Python 3.10+
+# C API, and there are no Windows wheels for Python 3.10+. Install it via
+# the helper script, which forces pip to regenerate the C++ from .pyx using
+# a modern Cython in the active env (`--no-build-isolation`):
+#     powershell -ExecutionPolicy Bypass -File scripts/install_pkuseg.ps1

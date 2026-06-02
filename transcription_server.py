@@ -13,6 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import numpy as np
 from sensevoice_transcriber import SenseVoiceTranscriber
+import semantic_aligner
 import config
 
 # Server configuration
@@ -73,7 +74,8 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             self.end_headers()
             response = {
                 "status": "ok",
-                "ready": transcriber is not None and transcriber.is_ready() if transcriber else False
+                "ready": transcriber is not None and transcriber.is_ready() if transcriber else False,
+                "alignerReady": semantic_aligner.is_ready()
             }
             self.wfile.write(json.dumps(response).encode())
         else:
@@ -170,6 +172,50 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
+        elif self.path == '/align':
+            # Cross-lingual semantic-unit alignment. Body shape:
+            #   { "transcription": "<source sentence>", "translation": "<target sentence>" }
+            # Response shape (matches the renderer's existing contract):
+            #   { "transcriptionChunks": [...], "translationChunks": [...], "correlations": [...] }
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                if content_length == 0:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "No data provided"}).encode())
+                    return
+
+                body = self.rfile.read(content_length)
+                request_data = json.loads(body.decode('utf-8'))
+
+                transcription = request_data.get('transcription', '') or ''
+                translation = request_data.get('translation', '') or ''
+                if not transcription.strip() or not translation.strip():
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "error": "Both 'transcription' and 'translation' are required"
+                    }).encode())
+                    return
+
+                result = semantic_aligner.align(transcription, translation)
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                # ensure_ascii=False so Han chars round-trip as themselves, not \uXXXX escapes
+                self.wfile.write(json.dumps(result, ensure_ascii=False).encode('utf-8'))
+
+            except Exception as e:
+                print(f"Alignment error: {e}", file=sys.stderr, flush=True)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -190,6 +236,18 @@ def main():
             print(f"Background initialization failed: {e}", file=sys.stderr, flush=True)
     
     threading.Thread(target=init_in_background, daemon=True).start()
+
+    # Warm up the semantic aligner (pkuseg + SimAlign / XLM-R) in the background
+    # so the first /align request from the renderer isn't blocked on a ~1 GB
+    # model download / load. Failures are non-fatal — the server still serves
+    # /transcribe; /align will surface a clear error on first use instead.
+    def warmup_aligner_in_background():
+        try:
+            semantic_aligner.warmup()
+        except Exception as e:
+            print(f"Aligner warmup failed: {e}", file=sys.stderr, flush=True)
+
+    threading.Thread(target=warmup_aligner_in_background, daemon=True).start()
     
     # Start HTTP server
     try:

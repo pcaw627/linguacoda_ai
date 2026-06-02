@@ -9,7 +9,7 @@ The project is an **Electron desktop app** with:
 - **Electron Main Process (Node.js)**: owns the app window, starts the Python backend, provides IPC handlers, and performs LLM calls for translation/analysis.
 - **Electron Renderer (HTML/CSS/JS)**: the UI, state management for pairs, scrolling/zoom behavior, and the semantic-unit detail view.
 - **Python Backend (`electron_backend.py`)**: captures audio from the selected device, buffers it, talks to an external transcription server, and streams transcription results to Electron via stdout.
-- **Transcription Server (`transcription_server.py` + `transcription_client.py`)**: a local HTTP service that performs **ASR via SenseVoice** (see `sensevoice_transcriber.py`) and returns `(transcription, detectedLang)`.
+- **Transcription Server (`transcription_server.py` + `transcription_client.py`)**: a local HTTP service that performs **ASR via SenseVoice** (see `sensevoice_transcriber.py`), **cross-lingual word alignment via SimAlign** (`semantic_aligner.py`), and returns transcription or alignment results.
 
 At runtime the flow looks like:
 
@@ -22,12 +22,13 @@ At runtime the flow looks like:
 
 ## AI Components (Where the “AI” Lives)
 
-This project has **two distinct AI subsystems**:
+This project has **three distinct AI subsystems**:
 
 1) **Speech-to-Text (ASR)** — runs in the **transcription server** (Python), implemented with **SenseVoice**.
-2) **Text-to-Text LLM tasks** — run in the **Electron main process** (Node) by calling a local **Ollama** endpoint:
+2) **Cross-lingual word alignment** — runs in the **transcription server** (Python), implemented with **pkuseg + SimAlign** (XLM-R embeddings, IterMax matching) for the semantic-unit detail view.
+3) **Text-to-Text LLM tasks** — run in the **Electron main process** (Node) by calling a local **Ollama** endpoint:
    - Translation (transcription → English)
-   - Semantic unit alignment (for the detail view)
+   - Vocab context generation (optional learning features)
 
 ### ASR: SenseVoice Transcription
 
@@ -47,25 +48,31 @@ This project has **two distinct AI subsystems**:
   - `ollamaEndpoint` (default `http://127.0.0.1:11434`)
   - `ollamaModel` (e.g. `gemma3:4b`)
 
-### LLM: Semantic Unit Alignment (Detail View) via Ollama
+### Semantic Unit Alignment (Detail View) via SimAlign
 
-- **Where**: Electron main process (`main.js`) exposes an IPC handler `extract-semantic-units`.
-- **How**: The handler performs a **two-phase LLM pipeline** against Ollama:
-  1. **Phase 1 – Tokenize**: A prompt asks the LLM to split both the transcription and translation into meaningful chunks (words or short phrases like "book", "on time"). Each chunk receives a unique ID (`t1`, `t2`, … for transcription; `e1`, `e2`, … for translation). Repeated words get separate IDs so each occurrence is addressable. Parenthetical clarifiers/tags (e.g., "(referring to X)") are excluded from the tokenization.
-  2. **Phase 2 – Correlate with retry**: A second prompt sends both chunk lists and asks the LLM to map each transcription chunk ID to its best-matching translation chunk ID (or `null`). The handler checks which transcription chunk IDs were not covered in the response and **retries** (up to 3 attempts) with a focused prompt listing the missing IDs, ensuring every chunk is attempted at least once.
-- **Return shape**:
+- **Where**: `semantic_aligner.py`, served by `transcription_server.py` at `POST /align`. Electron main process (`main.js`) IPC handler `extract-semantic-units` proxies to that endpoint.
+- **How** — deterministic pipeline (no LLM, no JSON parsing):
+  1. **Strip parentheticals** from both sides (ASCII `()` and full-width `（）`), so clarifiers like `(referring to X)` never become chunks.
+  2. **Tokenize** each side independently:
+     - **Chinese** (any Han characters): **pkuseg** word segmentation — multi-character words like `墨西哥城` stay one chunk.
+     - **English / Latin**: whitespace split with outer punctuation stripped; inner punctuation preserved (`8,000`, `don't`).
+  3. **Align** with **SimAlign** (`xlm-roberta-base`, IterMax matching) on the token lists. IterMax derives many-to-many links from XLM-R cosine similarity (e.g. `墨西哥城` → `["Mexico", "City"]`).
+  4. **Package** chunks + correlations for the renderer (`t1`… / `e1`… IDs, `matches` arrays per transcription chunk).
+- **Warmup**: aligner + pkuseg load in a background thread at server startup so the first detail-view open isn't blocked on model download.
+- **Auth**: same Bearer token as `/transcribe` (`.transcription_server.token`).
+- **Return shape** (from `/align`, wrapped by IPC as `{ success: true, … }`):
   ```json
   {
-    "success": true,
     "transcriptionChunks": [{"id": "t1", "text": "…"}, …],
     "translationChunks":  [{"id": "e1", "text": "…"}, …],
-    "correlations": [{"id": "t1", "match": "e1"}, {"id": "t2", "match": null}, …]
+    "correlations": [{"id": "t1", "matches": ["e1", "e2"]}, {"id": "t2", "matches": []}, …]
   }
   ```
 - **Renderer usage**:
   - Renderer calls `window.electronAPI.extractSemanticUnits(transcription, translation)`
   - Modal shows "Analyzing semantic units…" while waiting
-  - On success, chunks are matched back to character positions in the original text and rendered as cards. Hover highlighting uses the correlation map (bidirectional) to link transcription ↔ translation cards
+  - On success, chunks are matched back to character positions in the original text. **Only chunks that appear in some mapping** are rendered as interactive cards; **unmapped chunks render as plain text**.
+  - Hover highlighting uses the correlation map (bidirectional, with sibling links across multi-match groups).
 
 ## Process & Module Responsibilities
 
@@ -80,7 +87,7 @@ This project has **two distinct AI subsystems**:
   - Capture control (start/stop)
   - Device enumeration / device selection persistence
   - Translation (LLM call via Ollama)
-  - Semantic-unit extraction (LLM call via Ollama for detail view)
+  - Semantic-unit alignment (HTTP proxy to transcription server `/align`)
 
 **Key concept: “IPC is the seam”**
 - The renderer never calls Python directly.
@@ -127,13 +134,16 @@ This project has **two distinct AI subsystems**:
   - `{ "type": "error", "data": ... }`
 
 **Important design detail**
-- The Python backend is intentionally “headless.” It does not render UI and does not call the translation/alignment LLM. Its AI-related responsibility is **feeding audio to the ASR server and forwarding ASR results upstream**.
+- The Python backend is intentionally “headless.” It does not render UI and does not call Ollama. Its AI-related responsibility is **feeding audio to the transcription server and forwarding ASR results upstream**.
 
 ### Transcription Server (`transcription_server.py`)
 
 **Responsibilities**
-- HTTP API (e.g., `/transcribe`) that accepts audio payloads and returns transcription text + metadata.
-- Owns the **ASR model runtime** (SenseVoice via `sensevoice_transcriber.py`).
+- HTTP API:
+  - `POST /transcribe` — audio payloads → transcription text + metadata.
+  - `POST /align` — `{ transcription, translation }` → semantic chunks + correlations (`semantic_aligner.py`).
+  - `GET /health` — includes `ready` (ASR) and `alignerReady` (pkuseg + SimAlign loaded).
+- Owns the **ASR model runtime** (SenseVoice via `sensevoice_transcriber.py`) and the **alignment runtime** (pkuseg + SimAlign / XLM-R).
 - Designed to be started by Electron (or already running), with health/readiness checks in the client.
 
 ## Data Flow (End-to-End)
@@ -160,8 +170,8 @@ Renderer performs **sentence splitting** so each “sentence-like fragment” be
 Translation is performed in the main process (LLM call) via:
 - `window.electronAPI.translateText(fragment)` → `ipcMain.handle('translate-text', ...)` → LLM endpoint.
 
-Semantic unit alignment (for the detail modal) is performed similarly:
-- `window.electronAPI.extractSemanticUnits(transcription, translation)` → `ipcMain.handle('extract-semantic-units', ...)` → LLM endpoint.
+Semantic unit alignment (for the detail modal):
+- `window.electronAPI.extractSemanticUnits(transcription, translation)` → `ipcMain.handle('extract-semantic-units', ...)` → `POST http://127.0.0.1:8765/align` (SimAlign).
 
 ### Display: Aligned Pair Rendering
 
@@ -206,18 +216,20 @@ Clicking either side of a pair opens a modal detail view that maps semantic unit
 **How it works**
 1. Renderer opens modal and shows a loading state.
 2. Renderer calls `window.electronAPI.extractSemanticUnits(transcription, translation)`.
-3. Main process runs a two-phase LLM pipeline:
-   - **Phase 1 (Tokenize)**: asks the LLM to split both sentences into meaningful chunks with unique IDs (`t1`, `t2`, …, `e1`, `e2`, …). Repeated words each get distinct IDs. Parenthetical tags/clarifiers are excluded.
-   - **Phase 2 (Correlate + Retry)**: asks the LLM to map each transcription chunk ID to its best translation chunk ID (or `null`). Retries up to 3 times if any transcription chunk IDs were omitted from the response.
+3. Main process forwards the pair to the transcription server's `/align` endpoint (`semantic_aligner.py`):
+   - strips parenthetical clarifiers/tags
+   - tokenizes Chinese with **pkuseg**, English with whitespace + punctuation rules
+   - runs **SimAlign** (XLM-R + IterMax) for many-to-many word alignment
 4. Renderer receives `{ transcriptionChunks, translationChunks, correlations }` and:
    - matches each chunk back to its character position in the original sentence text
-   - renders each matched chunk as a "rounded corners card"
-   - builds a bidirectional correlation map so hovering a card highlights all correlated cards across both sentences
+   - renders mapped chunks as "rounded corners cards" and unmapped chunks as plain text
+   - builds a bidirectional correlation map (with sibling links across multi-match groups) so hovering any card highlights every linked card on both sides
 
 **Rendering strategy**
 - `matchChunksToText` walks through the chunk list in order, searching forward in the original text to find each chunk's position (handles repeated words by advancing a cursor).
-- `renderChunksAsCards` fills gaps between chunks with plain text nodes.
-- `setupCorrelationHighlighting` builds a `chunkId → Set<chunkId>` map from the correlations array (bidirectional), and highlights linked cards on hover.
+- `collectMappedChunkIds` scans the correlations and returns the set of all chunk IDs (`t*` and `e*`) that participate in at least one non-empty mapping.
+- `renderChunksAsCards` renders each segment as either an interactive card (if its chunk ID is in the mapped set) or a plain text node (if it isn't). Gaps between segments are always plain text.
+- `setupCorrelationHighlighting` builds a `chunkId → Set<chunkId>` map from the correlations array — bidirectional between transcription and translation, and across siblings within a multi-match group — and highlights linked cards on hover.
 
 ## Configuration & Persistence
 
@@ -230,10 +242,8 @@ Clicking either side of a pair opens a modal detail view that maps semantic unit
 - Python backend emits `error` messages to Electron when capture/transcription fails.
 - Main process forwards errors to renderer so UI can display status updates.
 - Transcription server readiness is checked; startup includes retries/waits.
-- LLM calls (translation/semantic units) handle:
-  - network errors
-  - missing responses
-  - JSON parsing failures (semantic unit extraction)
+- LLM calls (translation, vocab context) and alignment (`/align`) handle network errors, timeouts, and missing/invalid responses.
+- First `/align` after a cold start may take longer while XLM-R loads (~1 GB); the server warms up the aligner in a background thread at startup.
 
 ## Extensibility Notes
 
@@ -242,5 +252,6 @@ Suggested extension points:
 - **Add new “suite” tools**: add a new menu button + a new view container in `index.html`, and route via renderer navigation helpers.
 - **Add new analyses for a pair**: add new IPC handlers in `main.js`, expose in `preload.js`, and add UI components in renderer.
 - **Improve sentence splitting**: extend the sentence-end regex to include `?`, `!`, `！？`, `…` (unicode ellipsis), etc.
-- **Cache semantic unit results**: store extracted units on `transcriptionPairs[pairIndex]` to avoid repeated LLM calls.
+- **Cache semantic unit results**: store extracted units on `transcriptionPairs[pairIndex]` to avoid repeated `/align` calls.
+- **Tune alignment**: adjust SimAlign matching method or add a cosine-similarity threshold in `semantic_aligner.py` if spurious links appear.
 

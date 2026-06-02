@@ -923,24 +923,56 @@ async function showDetailView(pairIndex) {
     }
 }
 
-// Render detail view with chunk-based cards and correlation highlighting
+// Render detail view with chunk-based cards and correlation highlighting.
+//
+// Correlations follow the many-to-many shape produced by the main process:
+//   [{ id: "t1", matches: ["e1", "e2"] }, { id: "t2", matches: [] }, ...]
+// (Older single-`match` entries are still tolerated for backwards compat.)
+//
+// Only chunks that participate in at least one mapping are rendered as
+// interactive cards; unmapped chunks fall back to plain text so the UI doesn't
+// imply a semantic link that the alignment pipeline never found.
 function renderDetailView(transcription, translation, transcriptionChunks, translationChunks, correlations) {
     const transcriptionContainer = document.getElementById('detail-transcription');
     const translationContainer = document.getElementById('detail-translation');
     
     transcriptionContainer.innerHTML = '';
     translationContainer.innerHTML = '';
+
+    // Compute which chunk IDs participate in any mapping.
+    const mappedChunkIds = collectMappedChunkIds(correlations);
     
     // Match LLM-tokenized chunks back to positions in the original text
     const transSegments = matchChunksToText(transcription, transcriptionChunks);
     const transLangSegments = matchChunksToText(translation, translationChunks);
     
-    // Render each sentence's chunks as interactive cards
-    renderChunksAsCards(transcriptionContainer, transcription, transSegments, 'transcription');
-    renderChunksAsCards(translationContainer, translation, transLangSegments, 'translation');
+    // Render each sentence's chunks; mapped → card, unmapped → plain text
+    renderChunksAsCards(transcriptionContainer, transcription, transSegments, 'transcription', mappedChunkIds);
+    renderChunksAsCards(translationContainer, translation, transLangSegments, 'translation', mappedChunkIds);
     
     // Wire up hover highlighting driven by the correlation map
     setupCorrelationHighlighting(correlations);
+}
+
+// Walks the correlations array and returns the set of all chunk IDs (both
+// transcription `t*` and translation `e*`) that participate in at least one
+// mapping. A transcription chunk is "mapped" iff its matches array is
+// non-empty; a translation chunk is "mapped" iff it appears in some
+// transcription chunk's matches array.
+function collectMappedChunkIds(correlations) {
+    const mapped = new Set();
+    if (!Array.isArray(correlations)) return mapped;
+    for (const corr of correlations) {
+        if (!corr || typeof corr.id !== 'string') continue;
+        const matches = Array.isArray(corr.matches)
+            ? corr.matches
+            : (corr.match ? [corr.match] : []);
+        const cleaned = matches.filter(m => typeof m === 'string' && m.length > 0);
+        if (cleaned.length === 0) continue;
+        mapped.add(corr.id);
+        for (const m of cleaned) mapped.add(m);
+    }
+    return mapped;
 }
 
 // Match an ordered list of chunks back to character positions in the original text.
@@ -990,45 +1022,54 @@ function matchChunksToText(text, chunks) {
     return segments;
 }
 
-// Render text with matched chunk segments as cards, filling gaps with plain text
-function renderChunksAsCards(container, fullText, segments, type) {
+// Render text with matched chunk segments. Mapped chunks (those whose IDs are
+// in `mappedChunkIds`) become interactive cards; unmapped chunks render as
+// plain text so the UI doesn't imply a semantic link that doesn't exist.
+// Gaps between segments are always plain text.
+function renderChunksAsCards(container, fullText, segments, type, mappedChunkIds) {
     if (!fullText) return;
     
     if (segments.length === 0) {
         container.textContent = fullText;
         return;
     }
-    
+
+    const mappedSet = mappedChunkIds instanceof Set ? mappedChunkIds : new Set();
     let currentPos = 0;
     
     for (const segment of segments) {
-        // Plain text before this card
+        // Plain text before this segment
         if (segment.start > currentPos) {
             container.appendChild(document.createTextNode(fullText.substring(currentPos, segment.start)));
         }
-        
-        // The card itself
-        const card = document.createElement('span');
-        card.className = 'detail-card';
-        card.dataset.type = type;
-        card.dataset.chunkId = segment.chunkId;
 
-        // Card visible text (kept as its own element so the tooltip child doesn't
-        // bleed into the layout)
-        const labelEl = document.createElement('span');
-        labelEl.className = 'detail-card-label';
-        labelEl.textContent = segment.text;
-        card.appendChild(labelEl);
+        if (mappedSet.has(segment.chunkId)) {
+            // Mapped chunk → interactive card
+            const card = document.createElement('span');
+            card.className = 'detail-card';
+            card.dataset.type = type;
+            card.dataset.chunkId = segment.chunkId;
 
-        // For Chinese chunks, attach a hover tooltip that shows pinyin under each char
-        attachDetailCardPinyinTooltip(card, segment.text);
+            // Card visible text (kept as its own element so the tooltip child doesn't
+            // bleed into the layout)
+            const labelEl = document.createElement('span');
+            labelEl.className = 'detail-card-label';
+            labelEl.textContent = segment.text;
+            card.appendChild(labelEl);
 
-        container.appendChild(card);
+            // For Chinese chunks, attach a hover tooltip that shows pinyin under each char
+            attachDetailCardPinyinTooltip(card, segment.text);
+
+            container.appendChild(card);
+        } else {
+            // Unmapped chunk → render as plain text (no card box, no hover)
+            container.appendChild(document.createTextNode(segment.text));
+        }
         
         currentPos = segment.end;
     }
     
-    // Trailing text after last card
+    // Trailing text after last segment
     if (currentPos < fullText.length) {
         container.appendChild(document.createTextNode(fullText.substring(currentPos)));
     }
@@ -1168,21 +1209,40 @@ function renderDetailCardTooltipContent(tooltip, chars, pinyinString) {
     }
 }
 
-// Build a bidirectional correlation map and wire hover events on cards
+// Build a bidirectional correlation map and wire hover events on cards.
+//
+// Correlations use the many-to-many shape `{ id: "t1", matches: ["e1", "e2"] }`
+// produced by the main process. Hovering any card in a group highlights every
+// other card that shares any link with it (including all siblings on the
+// translation side that map back to the same transcription chunk).
 function setupCorrelationHighlighting(correlations) {
     const cards = document.querySelectorAll('.detail-card');
     
     // Build lookup: chunkId → Set of correlated chunkIds
     const correlationMap = {};
+    const addLink = (a, b) => {
+        if (!a || !b || a === b) return;
+        if (!correlationMap[a]) correlationMap[a] = new Set();
+        correlationMap[a].add(b);
+    };
+
     for (const corr of correlations) {
-        if (!corr || !corr.id) continue;
-        if (!correlationMap[corr.id]) correlationMap[corr.id] = new Set();
-        
-        if (corr.match) {
-            correlationMap[corr.id].add(corr.match);
-            // Reverse direction so hovering the translation card also highlights
-            if (!correlationMap[corr.match]) correlationMap[corr.match] = new Set();
-            correlationMap[corr.match].add(corr.id);
+        if (!corr || typeof corr.id !== 'string') continue;
+        const matches = Array.isArray(corr.matches)
+            ? corr.matches
+            : (corr.match ? [corr.match] : []);
+        const cleaned = matches.filter(m => typeof m === 'string' && m.length > 0);
+        if (cleaned.length === 0) continue;
+
+        // Bidirectional t ↔ each e
+        for (const m of cleaned) {
+            addLink(corr.id, m);
+            addLink(m, corr.id);
+        }
+        // Sibling links: hovering one translation chunk in a multi-match group
+        // should also highlight the others (they collectively form the unit).
+        for (const a of cleaned) {
+            for (const b of cleaned) addLink(a, b);
         }
     }
     

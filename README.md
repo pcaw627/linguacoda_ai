@@ -39,6 +39,28 @@ A desktop application that helps you learn foreign languages by:
    pip install -r requirements.txt
    ```
 
+   Then install pkuseg (Chinese word segmentation) plus the rest of the
+   alignment runtime via the helper script — pkuseg's PyPI source distribution
+   ships pre-generated Cython C++ that is incompatible with Python 3.10+ on
+   Windows, so `pip install pkuseg` alone fails. The helper installs a modern
+   Cython into the active env and uses `pip install --no-build-isolation` so
+   pkuseg's `setup.py` regenerates fresh C++ from the `.pyx` sources. It also
+   pins `transformers<4.41` and installs `simalign` + `sentencepiece` so
+   SimAlign can load against the Torch your speech stack already shipped.
+
+   Activate the env you want pkuseg installed into, then run the script
+   **in-process** (do NOT use `powershell -File`, which spawns a fresh shell
+   that drops your conda activation):
+   ```powershell
+   conda activate livesub
+   .\scripts\install_pkuseg.ps1
+   ```
+   The script refuses to run in conda `base` unless you pass `-AllowBaseEnv`,
+   so a misfired activation fails loudly instead of silently installing into
+   the wrong env. Prereq: MSVC C++ Build Tools must already be installed
+   (`winget install Microsoft.VisualStudio.2022.BuildTools`, then enable
+   "Desktop development with C++" in the Visual Studio Installer).
+
 3. (Optional) Install ffmpeg for better audio handling:
    - **Using winget** (Windows 10/11):
      ```powershell

@@ -51,4 +51,4 @@ models/
 *.sqlite
 
 node_modules/
-./transcription_server.token
+.transcription_server.token
