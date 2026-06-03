@@ -16,6 +16,10 @@ let pendingScrollUpdate = false; // Flag to prevent multiple RAF calls
 // View navigation
 let currentView = 'menu'; // 'menu' or 'transcription'
 
+// Transcription service readiness (server has loaded the SenseVoice model)
+let transcriptionReady = false;
+let transcriptionReadyPollTimer = null;
+
 // Vocab tracker state
 let seenVocab = JSON.parse(localStorage.getItem('seenVocab') || '{}'); // { word: count }
 let allHskWords = {}; // { word: hskLevel } loaded from local JSON
@@ -96,6 +100,52 @@ async function initializeTranscriptionView() {
     // Update threshold slider
     document.getElementById('volume-threshold').value = volumeThreshold;
     updateThresholdDisplay();
+
+    // Reflect transcription-service readiness on the status badge: keep it
+    // yellow "Loading..." until the server reports the SenseVoice model is ready.
+    updateUI();
+    startTranscriptionReadyPolling();
+}
+
+// Poll the transcription server's /health endpoint until it reports the model
+// is ready. While not ready, the status badge stays yellow "Loading..."; once
+// ready it flips back to the green "Ready" badge.
+function startTranscriptionReadyPolling() {
+    if (transcriptionReady) {
+        if (!isCapturing) updateStatus('Ready', 'ready');
+        return;
+    }
+
+    if (!isCapturing) updateStatus('Loading...', 'loading');
+
+    if (transcriptionReadyPollTimer) {
+        clearTimeout(transcriptionReadyPollTimer);
+        transcriptionReadyPollTimer = null;
+    }
+
+    pollTranscriptionReady();
+}
+
+async function pollTranscriptionReady() {
+    let ready = false;
+    try {
+        const status = await window.electronAPI.getTranscriptionStatus();
+        ready = !!(status && status.ready);
+    } catch (err) {
+        ready = false;
+    }
+
+    if (ready) {
+        transcriptionReady = true;
+        transcriptionReadyPollTimer = null;
+        // Don't clobber an in-progress capture/stopped status.
+        if (!isCapturing) updateStatus('Ready', 'ready');
+        updateUI();
+        return;
+    }
+
+    if (!isCapturing) updateStatus('Loading...', 'loading');
+    transcriptionReadyPollTimer = setTimeout(pollTranscriptionReady, 1000);
 }
 
 // Setup window controls (always available)
@@ -154,6 +204,7 @@ function setupEventListeners() {
     // Control buttons
     document.getElementById('start-btn').addEventListener('click', startCapture);
     document.getElementById('stop-btn').addEventListener('click', stopCapture);
+    document.getElementById('clear-btn').addEventListener('click', clearTranscript);
     
     // Setup scroll synchronization between transcription and translation containers
     setupScrollSync();
@@ -803,10 +854,28 @@ function recalculatePairHeights(pairWrappers) {
 
 // Update UI state
 function updateUI() {
-    document.getElementById('start-btn').disabled = isCapturing;
+    // Can't start capturing until the transcription service has finished loading.
+    document.getElementById('start-btn').disabled = isCapturing || !transcriptionReady;
     document.getElementById('stop-btn').disabled = !isCapturing;
     document.getElementById('device-select').disabled = isCapturing;
     document.getElementById('language-select').disabled = isCapturing;
+}
+
+// Clear every entry from the transcription/translation view.
+// NOTE: this only clears the on-screen transcript — the HSK vocab tracker
+// statistics gathered so far are intentionally left untouched.
+function clearTranscript() {
+    transcriptionPairs = [];
+
+    const transcriptionContainer = document.getElementById('transcription-text');
+    const translationContainer = document.getElementById('translation-text');
+    if (transcriptionContainer) transcriptionContainer.innerHTML = '';
+    if (translationContainer) translationContainer.innerHTML = '';
+
+    // Reset scroll bookkeeping so the next entry autoscrolls cleanly.
+    isAtBottom = true;
+
+    updateDisplay();
 }
 
 // Update status
@@ -1135,6 +1204,14 @@ function attachDetailCardPinyinTooltip(card, text) {
         if (detailCardTooltipEl && detailCardTooltipEl.dataset.activeKey === text) {
             hideDetailCardTooltip();
         }
+    });
+
+    // Click → open the same vocab context modal as the vocab tracker, using the
+    // chunk text as the lookup word and current seen count for the header label.
+    card.addEventListener('click', (e) => {
+        e.stopPropagation();
+        hideDetailCardTooltip();
+        showVocabContextModal(text, seenVocab[text] || 0);
     });
 }
 

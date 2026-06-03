@@ -498,6 +498,25 @@ ipcMain.handle('extract-semantic-units', async (event, transcription, translatio
   }
 });
 
+// Report transcription service readiness so the renderer can show a
+// "Loading..." badge until the SenseVoice model has finished initializing
+// (i.e. until the server logs "Transcription service ready").
+ipcMain.handle('get-transcription-status', async () => {
+  try {
+    const response = await axios.get('http://127.0.0.1:8765/health', { timeout: 1500 });
+    if (response.status === 200 && response.data) {
+      return {
+        success: true,
+        ready: !!response.data.ready,
+        alignerReady: !!response.data.alignerReady
+      };
+    }
+    return { success: false, ready: false };
+  } catch (error) {
+    return { success: false, ready: false };
+  }
+});
+
 // Load HSK dictionary from local JSON file
 ipcMain.handle('get-hsk-dictionary', async () => {
   try {
@@ -655,31 +674,39 @@ app.whenReady().then(async () => {
     }
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(menuTemplate));
-  
-  // Check if transcription server is already running
-  const serverRunning = await checkTranscriptionServer();
-  if (!serverRunning) {
-    console.log('[TranscriptionServer] Server not running, starting it...');
-    await startTranscriptionServer();
-    // Wait a moment for server to start and verify it's running
-    let attempts = 0;
-    while (attempts < 10) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      const isRunning = await checkTranscriptionServer();
-      if (isRunning) {
-        console.log('[TranscriptionServer] Server started successfully');
-        break;
-      }
-      attempts++;
-    }
-    if (attempts >= 10) {
-      console.warn('[TranscriptionServer] Server may not have started properly, but continuing...');
-    }
-  } else {
-    console.log('[TranscriptionServer] Server already running, connecting to existing instance...');
-  }
-  
+
+  // Start the audio backend right away (it loads the cached device list and
+  // connects to the transcription server lazily, retrying until it's up). This
+  // runs concurrently with bringing the transcription server online below so
+  // device enumeration isn't blocked behind the server's health check.
   startPythonBackend();
+
+  // Bring up the transcription server in parallel. The server binds its HTTP
+  // port immediately and loads the SenseVoice model + pkuseg/SimAlign aligner
+  // on background threads, so /health responds well before the models finish.
+  (async () => {
+    const serverRunning = await checkTranscriptionServer();
+    if (!serverRunning) {
+      console.log('[TranscriptionServer] Server not running, starting it...');
+      await startTranscriptionServer();
+      // Wait a moment for server to start and verify it's running
+      let attempts = 0;
+      while (attempts < 10) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const isRunning = await checkTranscriptionServer();
+        if (isRunning) {
+          console.log('[TranscriptionServer] Server started successfully');
+          break;
+        }
+        attempts++;
+      }
+      if (attempts >= 10) {
+        console.warn('[TranscriptionServer] Server may not have started properly, but continuing...');
+      }
+    } else {
+      console.log('[TranscriptionServer] Server already running, connecting to existing instance...');
+    }
+  })();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

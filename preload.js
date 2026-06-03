@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   extractSemanticUnits: (transcription, translation) => ipcRenderer.invoke('extract-semantic-units', transcription, translation),
   setVolumeThreshold: (threshold) => ipcRenderer.invoke('set-volume-threshold', threshold),
   getHskDictionary: () => ipcRenderer.invoke('get-hsk-dictionary'),
+  getTranscriptionStatus: () => ipcRenderer.invoke('get-transcription-status'),
   getPinyin: (text) => ipcRenderer.invoke('get-pinyin', text),
   generateVocabContext: (word) => ipcRenderer.invoke('generate-vocab-context', word),
   windowMinimize: () => ipcRenderer.invoke('window-minimize'),

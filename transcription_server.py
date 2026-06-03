@@ -72,9 +72,15 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
+            # "ready" intentionally reflects ONLY the SenseVoice transcriber, so
+            # the UI flips from Loading → Ready as soon as /transcribe is usable.
+            # The semantic aligner (pkuseg + SimAlign) is reported separately via
+            # "alignerReady" and must NOT gate "ready": it only powers /align
+            # (the semantic-links detail view) and loads later/lazily.
+            transcriber_ready = transcriber is not None and transcriber.is_ready()
             response = {
                 "status": "ok",
-                "ready": transcriber is not None and transcriber.is_ready() if transcriber else False,
+                "ready": transcriber_ready,
                 "alignerReady": semantic_aligner.is_ready()
             }
             self.wfile.write(json.dumps(response).encode())
@@ -228,26 +234,29 @@ def main():
     print(f"TRANSCRIPTION_SERVER_TOKEN={token}", file=sys.stdout, flush=True)
     print(f"Transcription server starting on {SERVER_HOST}:{SERVER_PORT}", file=sys.stderr, flush=True)
     
-    # Initialize transcriber in background
+    # Initialize the transcription pipeline in the background, prioritizing the
+    # critical path:
+    #   1. SenseVoice transcriber — the only thing /transcribe needs. Loaded
+    #      first so the app can start capturing/transcribing ASAP.
+    #   2. Semantic aligner (pkuseg + SimAlign / XLM-R) — only needed by /align,
+    #      i.e. when the user opens the semantic-links detail view. Warmed up
+    #      *after* the transcriber so its ~1 GB load doesn't compete with
+    #      SenseVoice for CPU/RAM/disk during cold start. If the user opens the
+    #      detail view before this finishes, /align still loads it lazily.
+    # Both steps are guarded; a failure in one doesn't block the other or the
+    # HTTP server (which binds below regardless).
     def init_in_background():
         try:
             init_transcriber()
         except Exception as e:
             print(f"Background initialization failed: {e}", file=sys.stderr, flush=True)
-    
-    threading.Thread(target=init_in_background, daemon=True).start()
 
-    # Warm up the semantic aligner (pkuseg + SimAlign / XLM-R) in the background
-    # so the first /align request from the renderer isn't blocked on a ~1 GB
-    # model download / load. Failures are non-fatal — the server still serves
-    # /transcribe; /align will surface a clear error on first use instead.
-    def warmup_aligner_in_background():
         try:
             semantic_aligner.warmup()
         except Exception as e:
             print(f"Aligner warmup failed: {e}", file=sys.stderr, flush=True)
 
-    threading.Thread(target=warmup_aligner_in_background, daemon=True).start()
+    threading.Thread(target=init_in_background, daemon=True).start()
     
     # Start HTTP server
     try:

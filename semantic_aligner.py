@@ -238,19 +238,36 @@ def align(transcription: str, translation: str) -> Dict[str, Any]:
 def warmup() -> None:
     """Best-effort load + tiny dry-run so the first `/align` request isn't slow.
 
+    pkuseg and SimAlign are independent (separate libraries, separate locks),
+    so we load them on separate threads to overlap their startup cost — most
+    of the wall-clock time is spent in C-extension / torch model loading that
+    releases the GIL, so this meaningfully shortens cold start.
+
     Each step is independently guarded so a missing dependency (e.g., pkuseg
     not installed) doesn't prevent the rest of the server from coming up —
     the `/align` endpoint will surface the same error on first use, pointing
     the user at `scripts/install_pkuseg.ps1`.
     """
-    try:
-        _get_pkuseg().cut("你好")
-    except Exception as e:
-        print(f"[SemanticAligner] pkuseg warmup failed: {e}", file=sys.stderr, flush=True)
-    try:
-        _get_aligner().get_word_aligns(["hello"], ["你好"])
-    except Exception as e:
-        print(f"[SemanticAligner] SimAlign warmup failed: {e}", file=sys.stderr, flush=True)
+    def _warm_pkuseg():
+        try:
+            _get_pkuseg().cut("你好")
+        except Exception as e:
+            print(f"[SemanticAligner] pkuseg warmup failed: {e}", file=sys.stderr, flush=True)
+
+    def _warm_simalign():
+        try:
+            _get_aligner().get_word_aligns(["hello"], ["你好"])
+        except Exception as e:
+            print(f"[SemanticAligner] SimAlign warmup failed: {e}", file=sys.stderr, flush=True)
+
+    threads = [
+        threading.Thread(target=_warm_pkuseg, name="warmup-pkuseg", daemon=True),
+        threading.Thread(target=_warm_simalign, name="warmup-simalign", daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 def is_ready() -> bool:
