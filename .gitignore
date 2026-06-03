@@ -52,3 +52,4 @@ models/
 
 node_modules/
 .transcription_server.token
+device_cache.json
