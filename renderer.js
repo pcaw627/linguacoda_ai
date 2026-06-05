@@ -15,6 +15,7 @@ let pendingScrollUpdate = false; // Flag to prevent multiple RAF calls
 
 // View navigation
 let currentView = 'menu'; // 'menu' or 'transcription'
+let transcriptionViewInitialized = false; // one-time listener/UI setup guard
 
 // Transcription service readiness (server has loaded the SenseVoice model)
 let transcriptionReady = false;
@@ -92,9 +93,15 @@ async function initializeTranscriptionView() {
         volumeThreshold = config.volumeThreshold;
     }
     
-    // Setup UI
-    setupEventListeners();
-    setupElectronListeners();
+    // Wire up DOM + IPC listeners exactly once. This function runs every time
+    // the user navigates into the transcription view; without this guard each
+    // visit would register another set of listeners, causing every
+    // transcription result to be handled multiple times (duplicate entries).
+    if (!transcriptionViewInitialized) {
+        setupEventListeners();
+        setupElectronListeners();
+        transcriptionViewInitialized = true;
+    }
     await loadAudioDevices();
     
     // Update threshold slider
@@ -339,6 +346,13 @@ function setupScrollSync() {
 
 // Setup Electron IPC listeners
 function setupElectronListeners() {
+    // Defensively clear any previously-registered handlers so we never stack
+    // duplicate listeners on the same channel (which would cause each
+    // transcription result to be processed more than once).
+    window.electronAPI.removeAllListeners('transcription-result');
+    window.electronAPI.removeAllListeners('error');
+    window.electronAPI.removeAllListeners('audio-devices');
+
     window.electronAPI.onTranscriptionResult((data) => {
         handleTranscriptionResult(data);
     });
