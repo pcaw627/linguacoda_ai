@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getHskDictionary: () => ipcRenderer.invoke('get-hsk-dictionary'),
   getTranscriptionStatus: () => ipcRenderer.invoke('get-transcription-status'),
   getPinyin: (text) => ipcRenderer.invoke('get-pinyin', text),
+  getPinyinBatch: (words) => ipcRenderer.invoke('get-pinyin-batch', words),
   generateVocabContext: (word) => ipcRenderer.invoke('generate-vocab-context', word),
   windowMinimize: () => ipcRenderer.invoke('window-minimize'),
   windowMaximize: () => ipcRenderer.invoke('window-maximize'),

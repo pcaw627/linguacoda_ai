@@ -544,6 +544,24 @@ ipcMain.handle('get-pinyin', async (event, text) => {
   }
 });
 
+// Convert a batch of Chinese words to pinyin. Returns a { word: pinyinString } map.
+ipcMain.handle('get-pinyin-batch', async (event, words) => {
+  try {
+    if (!Array.isArray(words)) {
+      return { success: false, error: 'invalid words' };
+    }
+    const map = {};
+    for (const word of words) {
+      if (!word || typeof word !== 'string') continue;
+      map[word] = pinyin(word, { toneType: 'symbol', type: 'string', nonZh: 'consecutive' });
+    }
+    return { success: true, pinyin: map };
+  } catch (error) {
+    console.error('Pinyin batch conversion error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
 // Generate vocab context via Ollama
 ipcMain.handle('generate-vocab-context', async (event, word) => {
   try {

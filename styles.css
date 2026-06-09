@@ -883,6 +883,67 @@ body {
     color: var(--text-secondary);
 }
 
+/* Search bar (pushed to the right of the header) */
+.vocab-search {
+    margin-left: auto;
+    align-self: center;
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.vocab-search-input {
+    width: 240px;
+    padding: 7px 28px 7px 12px;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.vocab-search-input::placeholder {
+    color: var(--text-secondary);
+    opacity: 0.7;
+}
+
+.vocab-search-input:focus {
+    border-color: var(--accent, #4a9eff);
+    box-shadow: 0 0 0 2px rgba(74, 158, 255, 0.15);
+}
+
+.vocab-search-clear {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 18px;
+    height: 18px;
+    line-height: 16px;
+    text-align: center;
+    font-size: 16px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: none;
+    border-radius: 50%;
+    cursor: pointer;
+    padding: 0;
+}
+
+.vocab-search-clear:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.vocab-search-empty {
+    color: var(--text-secondary);
+    text-align: center;
+    padding: 32px 0;
+    font-size: 0.9rem;
+}
+
 .vocab-tracker-grid-container {
     display: flex;
     flex-direction: column;

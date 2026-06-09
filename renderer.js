@@ -26,6 +26,8 @@ let seenVocab = JSON.parse(localStorage.getItem('seenVocab') || '{}'); // { word
 let allHskWords = {}; // { word: hskLevel } loaded from local JSON
 let vocabContextCache = {}; // Cache for Ollama-generated contexts
 let pinyinCache = JSON.parse(localStorage.getItem('pinyinCache') || '{}'); // { word: pinyinString }
+let vocabSearchQuery = ''; // Current vocab tracker search text
+let allPinyinLoaded = false; // Whether pinyin for every HSK word has been fetched (for pinyin search)
 
 function showMenuView() {
     document.getElementById('menu-view').style.display = 'flex';
@@ -1386,7 +1388,97 @@ async function initializeVocabTracker() {
             return;
         }
     }
+    setupVocabSearch();
     renderVocabGrid();
+}
+
+// Normalize pinyin/latin text for searching: strip tone marks (and ü diaeresis)
+// via Unicode decomposition, remove spaces, and lowercase. E.g. "xuè" -> "xue".
+function normalizePinyin(str) {
+    return (str || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, '')
+        .toLowerCase();
+}
+
+// True if the string contains any Chinese (CJK) characters.
+function hasChineseChars(str) {
+    return /[\u4e00-\u9fff\u3400-\u4dbf]/.test(str);
+}
+
+// Fetch pinyin for every HSK word (levels 1-6) in one batch so that pinyin
+// search can match words the user has never hovered. Runs at most once.
+async function ensureAllPinyin() {
+    if (allPinyinLoaded) return;
+    const missing = Object.entries(allHskWords)
+        .filter(([word, level]) => level >= 1 && level <= 6 && !pinyinCache[word])
+        .map(([word]) => word);
+
+    if (missing.length === 0) {
+        allPinyinLoaded = true;
+        return;
+    }
+
+    try {
+        const result = await window.electronAPI.getPinyinBatch(missing);
+        if (result && result.success && result.pinyin) {
+            Object.assign(pinyinCache, result.pinyin);
+            try { localStorage.setItem('pinyinCache', JSON.stringify(pinyinCache)); } catch (e) { /* quota */ }
+        }
+    } catch (err) {
+        console.error('Batch pinyin fetch failed:', err);
+    }
+    allPinyinLoaded = true;
+}
+
+// Wire up the vocab search input + clear button (idempotent).
+function setupVocabSearch() {
+    const input = document.getElementById('vocab-search-input');
+    const clearBtn = document.getElementById('vocab-search-clear');
+    if (!input || input.dataset.bound === 'true') return;
+    input.dataset.bound = 'true';
+
+    input.addEventListener('input', async () => {
+        const raw = input.value.trim();
+        vocabSearchQuery = raw;
+        if (clearBtn) clearBtn.style.display = raw ? 'block' : 'none';
+
+        // A latin/pinyin query needs pinyin for all words, so load them once.
+        if (raw && !hasChineseChars(raw) && !allPinyinLoaded) {
+            await ensureAllPinyin();
+            // Bail if the query changed while we were loading.
+            if (input.value.trim() !== raw) return;
+        }
+        renderVocabGrid();
+    });
+
+    if (clearBtn) {
+        clearBtn.addEventListener('click', () => {
+            input.value = '';
+            vocabSearchQuery = '';
+            clearBtn.style.display = 'none';
+            renderVocabGrid();
+            input.focus();
+        });
+    }
+}
+
+// Decide whether a word matches the current search query. Empty query = match all.
+// Chinese queries match against the character; latin queries match against the
+// tone-stripped ("normalized") pinyin.
+function vocabMatchesSearch(word) {
+    const query = vocabSearchQuery;
+    if (!query) return true;
+
+    if (hasChineseChars(query)) {
+        return word.includes(query);
+    }
+
+    const normalizedQuery = normalizePinyin(query);
+    if (!normalizedQuery) return true;
+    const normalizedPinyin = normalizePinyin(pinyinCache[word] || '');
+    return normalizedPinyin.includes(normalizedQuery);
 }
 
 // Render the GitHub-style vocab grid grouped by HSK level
@@ -1402,17 +1494,32 @@ function renderVocabGrid() {
     let totalWords = 0;
     let totalSeen = 0;
 
+    let matchedWords = 0;
+
     for (const [word, level] of Object.entries(allHskWords)) {
         if (level < 1 || level > 6) continue; // Skip level 7 (above HSK 6)
-        if (!levels[level]) levels[level] = [];
-        levels[level].push(word);
         totalWords++;
         if (seenVocab[word] && seenVocab[word] > 0) totalSeen++;
+        if (!vocabMatchesSearch(word)) continue; // Apply search filter
+        if (!levels[level]) levels[level] = [];
+        levels[level].push(word);
+        matchedWords++;
     }
 
     // Update stats
     if (statsEl) {
-        statsEl.textContent = `${totalSeen} / ${totalWords} words seen`;
+        statsEl.textContent = vocabSearchQuery
+            ? `${matchedWords} match${matchedWords !== 1 ? 'es' : ''} · ${totalSeen} / ${totalWords} words seen`
+            : `${totalSeen} / ${totalWords} words seen`;
+    }
+
+    // Nothing matched the search → show an empty state.
+    if (vocabSearchQuery && matchedWords === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'vocab-search-empty';
+        empty.textContent = `No words match “${vocabSearchQuery}”.`;
+        gridContainer.appendChild(empty);
+        return;
     }
 
     // Render each level section
