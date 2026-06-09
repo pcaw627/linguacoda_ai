@@ -44,6 +44,9 @@
                     <button id="subtitles-translation-btn" class="menu-button">
                         <span class="menu-button-text">Subtitles and Translation</span>
                     </button>
+                    <button id="tone-matching-btn" class="menu-button">
+                        <span class="menu-button-text">Tone Matching</span>
+                    </button>
                 </div>
             </div>
 
@@ -183,6 +186,76 @@
                 </div>
             </div>
             </div>
+        </div>
+
+        <!-- Tone Matching View -->
+        <div id="tone-matching-view" class="view-container tone-matching-view" style="display: none;">
+            <div class="tone-matching-topbar">
+                <button id="tone-back-btn" class="btn btn-back" title="Back to Home" aria-label="Back to Home">
+                    <svg class="back-arrow" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                        <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="currentColor"/>
+                    </svg>
+                </button>
+                <h2 class="tone-matching-title">Tone Matching</h2>
+            </div>
+
+            <!-- Top bar: audio device selection -->
+            <div class="tone-controls-top">
+                <div class="control-group">
+                    <label for="tone-device-select">Audio Device</label>
+                    <div class="select-wrapper">
+                        <select id="tone-device-select" class="styled-select">
+                            <option value="">Loading devices...</option>
+                        </select>
+                            <button id="tone-refresh-devices" class="icon-button" title="Refresh Devices">
+                                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor">
+                                    <path d="M13.5 2.5 C12.8 1.8 11.9 1.3 11 1.1 M2.5 13.5 C3.2 14.2 4.1 14.7 5 14.9 M14.9 5 C14.7 4.1 14.2 3.2 13.5 2.5 M1.1 11 C1.3 11.9 1.8 12.8 2.5 13.5" stroke-width="1.5" stroke-linecap="round"/>
+                                    <path d="M14.9 5 L11 5 L11 1.1" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <path d="M1.1 11 L5 11 L5 14.9" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <span id="tone-status" class="status status-loading">Loading...</span>
+                </div>
+
+            <div class="tone-matching-body">
+                <!-- Main practice area -->
+                <div class="tone-main">
+                    <!-- Large character display -->
+                    <div class="tone-display" id="tone-display">
+                        <span class="tone-display-char" id="tone-display-char">—</span>
+                        <span class="tone-display-pinyin" id="tone-display-pinyin">Loading…</span>
+                    </div>
+
+                    <!-- Microphone toggle with reactive waves -->
+                    <div class="tone-mic-area">
+                        <button id="tone-mic-btn" class="tone-mic-btn" title="Toggle microphone" aria-pressed="false">
+                            <span class="tone-mic-ring tone-mic-ring-1"></span>
+                            <span class="tone-mic-ring tone-mic-ring-2"></span>
+                            <span class="tone-mic-ring tone-mic-ring-3"></span>
+                            <span class="tone-mic-icon">
+                                <svg viewBox="0 0 24 24" width="34" height="34" fill="currentColor" aria-hidden="true">
+                                    <path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/>
+                                    <path d="M19 11a1 1 0 0 0-2 0 5 5 0 0 1-10 0 1 1 0 0 0-2 0 7 7 0 0 0 6 6.92V21a1 1 0 0 0 2 0v-3.08A7 7 0 0 0 19 11z"/>
+                                </svg>
+                            </span>
+                        </button>
+                        <div class="tone-mic-hint" id="tone-mic-hint">Tap the mic, then say the character above</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Feedback toasts -->
+            <div id="tone-toast-container" class="tone-toast-container"></div>
+
+            <!-- Skip to next character -->
+            <button id="tone-skip-btn" class="tone-skip-btn" title="Skip to a new character">
+                Skip
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+                    <path d="M5 4l8 8-8 8V4zm9 0h2v16h-2V4z"/>
+                </svg>
+            </button>
         </div>
 
         <!-- Detail View Modal -->

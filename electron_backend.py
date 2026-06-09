@@ -6,6 +6,7 @@ import sys
 import json
 import threading
 import queue
+import re
 import numpy as np
 import time
 from audio_capture import AudioCapture
@@ -292,6 +293,10 @@ class ElectronBackend:
             transcription, detected_lang = self.transcriber.transcribe(audio_data, transcription_lang)
 
             self._send_log(f"Transcription result: '{transcription}', detected_lang: {detected_lang}")
+
+            # Post-process: convert numerals to Chinese characters and strip
+            # periods. If nothing meaningful remains, treat it as silence below.
+            transcription = self._postprocess_transcription(transcription, detected_lang)
 
             if transcription and transcription.strip() and "_" not in transcription:
                 # Handle language detection
@@ -633,6 +638,114 @@ class ElectronBackend:
         """Set volume threshold"""
         self.volume_threshold = threshold
         config.VOLUME_THRESHOLD = threshold
+
+    def set_buffer_max_duration(self, duration):
+        """Set the maximum audio buffer length (seconds) before a buffer is
+        force-processed. A smaller value yields shorter, snappier utterances
+        (used by the Tone Matching view); the transcription view keeps the
+        default. Falls back to the config default when given an invalid value.
+        """
+        try:
+            value = float(duration)
+        except (TypeError, ValueError):
+            value = config.BUFFER_MAX_DURATION
+        if value <= 0:
+            value = config.BUFFER_MAX_DURATION
+        self.buffer_max_duration = value
+
+    # ----- Transcription text post-processing -----
+    CN_DIGITS = '零一二三四五六七八九'
+    CN_UNITS = ['', '十', '百', '千']
+    CN_BIG_UNITS = ['', '万', '亿', '兆']
+    NUMBER_TOKEN_RE = re.compile(r'\d[\d,]*(?:\.\d+)?')
+
+    def _should_convert_numbers(self, text, detected_lang):
+        """Only rewrite digits as Chinese numerals in a Chinese context so we
+        don't mangle numbers in, say, an English transcription."""
+        if self.selected_language in ('zh', 'yue'):
+            return True
+        if detected_lang in ('zh', 'yue'):
+            return True
+        return bool(re.search(r'[\u4e00-\u9fff]', text))
+
+    def _section_to_chinese(self, num):
+        """Convert an integer 0..9999 to Chinese characters (no myriad unit)."""
+        if num == 0:
+            return ''
+        s = ''
+        unit = 0
+        need_zero = False
+        while num > 0:
+            d = num % 10
+            if d == 0:
+                if s:
+                    need_zero = True
+            else:
+                sep = '零' if need_zero else ''
+                s = self.CN_DIGITS[d] + self.CN_UNITS[unit] + sep + s
+                need_zero = False
+            num //= 10
+            unit += 1
+        return s
+
+    def _int_to_chinese(self, n):
+        """Convert a non-negative integer to Chinese numerals (e.g. 10000 -> 一万)."""
+        if n == 0:
+            return '零'
+        result = ''
+        i = 0
+        while n > 0:
+            section = n % 10000
+            higher = n // 10000
+            if section == 0:
+                if result and not result.startswith('零'):
+                    result = '零' + result
+            else:
+                big = self.CN_BIG_UNITS[i] if i < len(self.CN_BIG_UNITS) else ''
+                chunk = self._section_to_chinese(section) + big
+                # A non-zero lower-magnitude section needs a 零 separator when it
+                # is missing its thousands digit (e.g. 10001 -> 一万零一).
+                if higher and section < 1000:
+                    chunk = '零' + chunk
+                result = chunk + result
+            n = higher
+            i += 1
+        # 一十... reads as 十... at the start of a number (10 -> 十, not 一十).
+        if result.startswith('一十'):
+            result = result[1:]
+        return result
+
+    def _number_token_to_chinese(self, token):
+        token = token.replace(',', '')
+        if '.' in token:
+            int_part, _, frac_part = token.partition('.')
+            int_cn = self._int_to_chinese(int(int_part)) if int_part != '' else '零'
+            frac_cn = ''.join(self.CN_DIGITS[int(ch)] for ch in frac_part)
+            return int_cn + '点' + frac_cn
+        return self._int_to_chinese(int(token))
+
+    def _convert_numbers_to_chinese(self, text):
+        """Replace Arabic numeral tokens (7, 10,000, 3.14) with Chinese numerals."""
+        def _safe(match):
+            try:
+                return self._number_token_to_chinese(match.group(0))
+            except Exception:
+                return match.group(0)
+        return self.NUMBER_TOKEN_RE.sub(_safe, text)
+
+    def _postprocess_transcription(self, transcription, detected_lang):
+        """Apply text fixes before sending to the UI:
+        1) numerals -> Chinese characters (in a Chinese context),
+        2) strip periods ('.' and '。').
+        Returns the cleaned string (may be empty, which the caller treats as
+        silence and does not forward to the UI).
+        """
+        if not transcription:
+            return transcription
+        if self._should_convert_numbers(transcription, detected_lang):
+            transcription = self._convert_numbers_to_chinese(transcription)
+        transcription = transcription.replace('.', '').replace('。', '')
+        return transcription
     
     def set_language(self, language):
         """Set transcription language"""
@@ -670,6 +783,9 @@ def main():
             elif action == "set-language":
                 language = command.get("language")
                 backend.set_language(language)
+            elif action == "set-buffer-duration":
+                duration = command.get("duration")
+                backend.set_buffer_max_duration(duration)
             elif action == "save-device-selection":
                 device_id = command.get("deviceId")
                 device_type = command.get("deviceType", "input")
