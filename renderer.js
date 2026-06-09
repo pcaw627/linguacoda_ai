@@ -29,9 +29,18 @@ let pinyinCache = JSON.parse(localStorage.getItem('pinyinCache') || '{}'); // { 
 let vocabSearchQuery = ''; // Current vocab tracker search text
 let allPinyinLoaded = false; // Whether pinyin for every HSK word has been fetched (for pinyin search)
 
+// Flashcards state
+// Cache of Ollama-generated dictionary entries: { word: [{ pinyin, meaning }, ...] }
+let flashcardEntryCache = JSON.parse(localStorage.getItem('flashcardEntryCache') || '{}');
+let flashcardSelection = null; // currently selected tile element
+let flashcardBusy = false;     // true while presenting a round (blocks re-entry)
+let lastFlashcardError = null; // last entry-fetch error, for user messaging
+let flashcardNextRoundPromise = null; // Promise<roundResult> for the preloaded round
+
 function showMenuView() {
     document.getElementById('menu-view').style.display = 'flex';
     document.getElementById('transcription-view').style.display = 'none';
+    document.getElementById('flashcards-view').style.display = 'none';
     currentView = 'menu';
     // Refresh vocab tracker when returning to menu
     initializeVocabTracker();
@@ -40,7 +49,15 @@ function showMenuView() {
 function showTranscriptionView() {
     document.getElementById('menu-view').style.display = 'none';
     document.getElementById('transcription-view').style.display = 'flex';
+    document.getElementById('flashcards-view').style.display = 'none';
     currentView = 'transcription';
+}
+
+function showFlashcardsView() {
+    document.getElementById('menu-view').style.display = 'none';
+    document.getElementById('transcription-view').style.display = 'none';
+    document.getElementById('flashcards-view').style.display = 'flex';
+    currentView = 'flashcards';
 }
 
 // Initialize
@@ -83,6 +100,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         showMenuView();
     });
+
+    // Flashcards navigation
+    document.getElementById('flashcards-btn').addEventListener('click', () => {
+        showFlashcardsView();
+        presentNextFlashcardRound();
+    });
+    document.getElementById('flashcards-back-btn').addEventListener('click', () => {
+        showMenuView();
+    });
+    document.getElementById('flashcards-next-btn').addEventListener('click', () => {
+        presentNextFlashcardRound();
+    });
+
+    // Start preparing the first round in the background as soon as the app opens
+    // so a round is "loaded in the chamber" before the user enters Flashcards.
+    preloadNextFlashcardRound();
     
     console.log('Application window ready. Starting main loop...');
 });
@@ -1661,5 +1694,420 @@ async function showVocabContextModal(word, count) {
         loading.style.display = 'none';
         errorEl.style.display = 'block';
         errorEl.textContent = `Error: ${err.message || 'Failed to generate context.'}`;
+    }
+}
+
+// ============================ Flashcards ============================
+// Duolingo-style matching game. The left column is one randomly chosen type
+// per round (characters / pinyin / meaning); the right column holds the
+// matching partner for each entry per the rules below. Words are drawn only
+// from vocab the user has actually seen (seenVocab). Meanings + pinyin come
+// from the Ollama-backed `get-flashcard-entry` IPC, which returns the
+// many-to-many (pinyin, meaning) entries for a word.
+
+const FLASHCARD_ROUND_SIZE = 5;
+
+// Strip parenthetical notes and the literal "with tone marks" placeholder the
+// model sometimes echoes. Mirrors cleanPinyin() in main.js so older cached
+// entries are normalized on read as well.
+function cleanFlashcardPinyin(pinyin) {
+    if (!pinyin) return '';
+    return String(pinyin)
+        .replace(/[\(（][^\)）]*[\)）]/g, ' ')
+        .replace(/with tone marks/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function sanitizeFlashcardEntries(entries) {
+    return entries.map(e => ({ pinyin: cleanFlashcardPinyin(e.pinyin), meaning: e.meaning }));
+}
+
+// Authoritative whole-word pinyin from pinyin-pro (deterministic, covers the
+// entire word). We use this instead of the LLM's pinyin, which sometimes splits
+// a compound into per-character readings (e.g. 多少 -> just "shǎo").
+async function getWordPinyin(word) {
+    if (pinyinCache[word]) return cleanFlashcardPinyin(pinyinCache[word]);
+    try {
+        const res = await window.electronAPI.getPinyin(word);
+        if (res && res.success && res.pinyin) {
+            pinyinCache[word] = res.pinyin;
+            try { localStorage.setItem('pinyinCache', JSON.stringify(pinyinCache)); } catch (e) { /* quota */ }
+            return cleanFlashcardPinyin(res.pinyin);
+        }
+        lastFlashcardError = (res && res.error) || 'No pinyin returned.';
+    } catch (err) {
+        lastFlashcardError = err && err.message ? err.message : String(err);
+    }
+    return '';
+}
+
+// Fetch (and cache) the dictionary entries for a word. Returns an array of
+// { pinyin, meaning } or null on failure.
+async function ensureFlashcardEntries(word) {
+    if (flashcardEntryCache[word] && flashcardEntryCache[word].length) {
+        return sanitizeFlashcardEntries(flashcardEntryCache[word]);
+    }
+    try {
+        const res = await window.electronAPI.getFlashcardEntry(word);
+        if (res && res.success && Array.isArray(res.entries) && res.entries.length) {
+            flashcardEntryCache[word] = res.entries;
+            try { localStorage.setItem('flashcardEntryCache', JSON.stringify(flashcardEntryCache)); } catch (e) { /* quota */ }
+            return sanitizeFlashcardEntries(res.entries);
+        }
+        lastFlashcardError = (res && res.error) || 'No dictionary entry returned.';
+        return null;
+    } catch (err) {
+        lastFlashcardError = err && err.message ? err.message : String(err);
+        return null;
+    }
+}
+
+function shuffleArray(arr) {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
+// Build the left/right display config for a round. Returns { leftType,
+// rightField, showPinyinBelowLeft, showPinyinBelowRight, promptText }.
+function pickRoundConfig() {
+    const leftType = ['character', 'pinyin', 'meaning'][Math.floor(Math.random() * 3)];
+    const showPinyin = Math.random() < 0.5;
+
+    let rightField;
+    let showPinyinBelowLeft = false;
+    let showPinyinBelowRight = false;
+
+    if (leftType === 'character') {
+        // 2a) characters on the left (pinyin sometimes shown below them)
+        if (showPinyin) {
+            showPinyinBelowLeft = true;
+            rightField = 'meaning'; // with pinyin shown, pair to the meaning
+        } else {
+            rightField = Math.random() < 0.5 ? 'pinyin' : 'meaning';
+        }
+    } else if (leftType === 'pinyin') {
+        // 2b) pinyin on the left -> character on the right
+        rightField = 'character';
+    } else {
+        // 2c) meaning on the left -> character on the right (pinyin sometimes below)
+        rightField = 'character';
+        showPinyinBelowRight = showPinyin;
+    }
+
+    const label = { character: 'characters', pinyin: 'pinyin', meaning: 'meanings' };
+    const rightLabel = { character: 'characters', pinyin: 'pinyin', meaning: 'meanings' };
+    const promptText = `Match the ${label[leftType]} on the left to the ${rightLabel[rightField]} on the right.`;
+
+    return { leftType, rightField, showPinyinBelowLeft, showPinyinBelowRight, promptText };
+}
+
+// Which fields must be non-empty for a card to be usable in this round.
+function requiredFieldsForRound(cfg) {
+    const needPinyin = cfg.leftType === 'pinyin' || cfg.rightField === 'pinyin' ||
+        cfg.showPinyinBelowLeft || cfg.showPinyinBelowRight;
+    const needMeaning = cfg.leftType === 'meaning' || cfg.rightField === 'meaning';
+    return { needPinyin, needMeaning };
+}
+
+// Unique key for the left tile's displayed content (so two left tiles can't be
+// visually identical). `card` is { word, pinyin, meaning }.
+function leftDisplayKey(card, cfg) {
+    if (cfg.leftType === 'character') return card.word + (cfg.showPinyinBelowLeft ? '\u0001' + card.pinyin : '');
+    if (cfg.leftType === 'pinyin') return card.pinyin;
+    return card.meaning;
+}
+
+// Unique key for the right tile's displayed content (so the match is
+// unambiguous — no two right tiles look the same).
+function rightDisplayKey(card, cfg) {
+    if (cfg.rightField === 'character') return card.word + (cfg.showPinyinBelowRight ? '\u0001' + card.pinyin : '');
+    if (cfg.rightField === 'pinyin') return card.pinyin;
+    return card.meaning;
+}
+
+// Build the visible {main, sub} for a tile given a side.
+function tileContent(card, cfg, side) {
+    if (side === 'left') {
+        if (cfg.leftType === 'character') return { main: card.word, sub: cfg.showPinyinBelowLeft ? card.pinyin : null, isChar: true };
+        if (cfg.leftType === 'pinyin') return { main: card.pinyin, sub: null, isChar: false };
+        return { main: card.meaning, sub: null, isChar: false };
+    }
+    // right
+    if (cfg.rightField === 'character') return { main: card.word, sub: cfg.showPinyinBelowRight ? card.pinyin : null, isChar: true };
+    if (cfg.rightField === 'pinyin') return { main: card.pinyin, sub: null, isChar: false };
+    return { main: card.meaning, sub: null, isChar: false };
+}
+
+function setFlashcardLoading(text) {
+    document.getElementById('flashcards-board').style.display = 'none';
+    document.getElementById('flashcards-message').style.display = 'none';
+    const loading = document.getElementById('flashcards-loading');
+    document.getElementById('flashcards-loading-text').textContent = text || 'Building round…';
+    loading.style.display = 'flex';
+}
+
+function showFlashcardMessage(text, kind) {
+    document.getElementById('flashcards-loading').style.display = 'none';
+    document.getElementById('flashcards-board').style.display = 'none';
+    const msg = document.getElementById('flashcards-message');
+    msg.className = 'flashcards-message' + (kind ? ' ' + kind : '');
+    msg.textContent = text;
+    msg.style.display = 'block';
+}
+
+// Build one round in the background. Resolves to a round result object:
+//   { ok: true, cards, cfg }  or  { ok: false, message, kind }
+// This performs the (potentially slow) Ollama entry fetches but does NOT touch
+// the DOM, so it can run passively while the user plays the current round.
+async function buildFlashcardRound() {
+    lastFlashcardError = null;
+
+    const pool = Object.keys(seenVocab).filter(w => seenVocab[w] > 0);
+    if (pool.length < FLASHCARD_ROUND_SIZE) {
+        return {
+            ok: false,
+            kind: 'error',
+            message: `You need at least ${FLASHCARD_ROUND_SIZE} seen words to play. Watch some content in the Subtitles and Translation view to build up your vocabulary, then come back!`
+        };
+    }
+
+    const cfg = pickRoundConfig();
+    const required = requiredFieldsForRound(cfg);
+    const candidates = shuffleArray(pool);
+
+    const cards = [];
+    const usedLeft = new Set();
+    const usedRight = new Set();
+
+    for (const word of candidates) {
+        if (cards.length >= FLASHCARD_ROUND_SIZE) break;
+
+        // Pinyin always comes from pinyin-pro (whole-word, deterministic).
+        let pinyin = '';
+        if (required.needPinyin) {
+            pinyin = await getWordPinyin(word);
+            if (!pinyin) continue;
+        }
+
+        // Meanings come from Ollama, but only fetch them when the round needs a
+        // meaning column. Try each meaning until one yields unique tile content.
+        let meaning = '';
+        if (required.needMeaning) {
+            const entries = await ensureFlashcardEntries(word);
+            if (!entries) continue;
+
+            let chosen = null;
+            for (const entry of shuffleArray(entries)) {
+                if (!entry.meaning) continue;
+                const candidate = { word, pinyin, meaning: entry.meaning };
+                const lk = leftDisplayKey(candidate, cfg);
+                const rk = rightDisplayKey(candidate, cfg);
+                if (!lk || !rk) continue;
+                if (usedLeft.has(lk) || usedRight.has(rk)) continue;
+                chosen = entry.meaning;
+                break;
+            }
+            if (!chosen) continue;
+            meaning = chosen;
+        }
+
+        const card = { pairId: cards.length, word, pinyin, meaning };
+        const lk = leftDisplayKey(card, cfg);
+        const rk = rightDisplayKey(card, cfg);
+        if (!lk || !rk || usedLeft.has(lk) || usedRight.has(rk)) continue;
+        usedLeft.add(lk);
+        usedRight.add(rk);
+        cards.push(card);
+    }
+
+    if (cards.length < FLASHCARD_ROUND_SIZE) {
+        const detail = lastFlashcardError ? ` (${lastFlashcardError})` : '';
+        return {
+            ok: false,
+            kind: 'error',
+            message: `Couldn't build a full round of ${FLASHCARD_ROUND_SIZE} cards from your seen words${detail}. Make sure Ollama is running, then try again.`
+        };
+    }
+
+    return { ok: true, cards, cfg };
+}
+
+// Kick off building the next round in the background (idempotent — does nothing
+// if a round is already preloaded or being built).
+function preloadNextFlashcardRound() {
+    if (flashcardNextRoundPromise) return;
+    flashcardNextRoundPromise = buildFlashcardRound();
+    // Swallow background errors; they surface to the user when the round is
+    // consumed by presentNextFlashcardRound().
+    flashcardNextRoundPromise.catch(() => {});
+}
+
+// Show the preloaded round (waiting for it if it isn't ready yet), then
+// immediately start preloading the following one.
+async function presentNextFlashcardRound() {
+    if (flashcardBusy) return;
+    flashcardBusy = true;
+    flashcardSelection = null;
+    const promptEl = document.getElementById('flashcards-prompt');
+    promptEl.textContent = '';
+    promptEl.classList.remove('success');
+
+    try {
+        if (!flashcardNextRoundPromise) preloadNextFlashcardRound();
+
+        // If the round is already prepared this loading state is replaced before
+        // the browser paints, so there's no flicker in the common case.
+        setFlashcardLoading('Building round…');
+
+        const pending = flashcardNextRoundPromise;
+        flashcardNextRoundPromise = null;
+        let result;
+        try {
+            result = await pending;
+        } catch (err) {
+            result = { ok: false, kind: 'error', message: `Failed to build round: ${err && err.message ? err.message : err}` };
+        }
+
+        if (!result.ok) {
+            showFlashcardMessage(result.message, result.kind);
+            return;
+        }
+
+        renderFlashcardBoard(result.cards, result.cfg);
+        document.getElementById('flashcards-prompt').textContent = result.cfg.promptText;
+
+        // Load the next round "into the chamber" right away.
+        preloadNextFlashcardRound();
+    } finally {
+        flashcardBusy = false;
+    }
+}
+
+function makeTile(card, cfg, side) {
+    const content = tileContent(card, cfg, side);
+    const tile = document.createElement('div');
+    tile.className = 'flashcard-tile' + (content.isChar ? ' is-character' : '');
+    tile.dataset.pairId = String(card.pairId);
+    tile.dataset.side = side;
+
+    const main = document.createElement('div');
+    main.className = 'flashcard-main';
+    main.textContent = content.main;
+    tile.appendChild(main);
+
+    if (content.sub) {
+        const sub = document.createElement('div');
+        sub.className = 'flashcard-sub';
+        sub.textContent = content.sub;
+        tile.appendChild(sub);
+    }
+
+    tile.addEventListener('click', () => onFlashcardTileClick(tile));
+    return tile;
+}
+
+function renderFlashcardBoard(cards, cfg) {
+    const leftCol = document.getElementById('flashcards-col-left');
+    const rightCol = document.getElementById('flashcards-col-right');
+    leftCol.innerHTML = '';
+    rightCol.innerHTML = '';
+
+    for (const card of cards) {
+        leftCol.appendChild(makeTile(card, cfg, 'left'));
+    }
+    // Right column is shuffled so positions don't give away the match.
+    for (const card of shuffleArray(cards)) {
+        rightCol.appendChild(makeTile(card, cfg, 'right'));
+    }
+
+    document.getElementById('flashcards-loading').style.display = 'none';
+    document.getElementById('flashcards-message').style.display = 'none';
+    document.getElementById('flashcards-board').style.display = 'grid';
+
+    // Shrink any text that would wrap so every card stays on a single line.
+    requestAnimationFrame(fitFlashcardTiles);
+}
+
+// Reduce the font size of each tile's main text until it fits on one line.
+function fitFlashcardTiles() {
+    const mains = document.querySelectorAll('#flashcards-board .flashcard-main');
+    const MIN_PX = 11;
+    mains.forEach(el => {
+        // Reset to the CSS-defined size (cleared inline style) before measuring.
+        el.style.fontSize = '';
+        let size = parseFloat(getComputedStyle(el).fontSize) || 24;
+        while (el.scrollWidth > el.clientWidth && size > MIN_PX) {
+            size -= 1;
+            el.style.fontSize = size + 'px';
+        }
+    });
+}
+
+function onFlashcardTileClick(tile) {
+    if (tile.classList.contains('matched')) return;
+    // Ignore clicks while a wrong-answer animation is resolving.
+    if (tile.classList.contains('wrong')) return;
+
+    if (!flashcardSelection) {
+        flashcardSelection = tile;
+        tile.classList.add('selected');
+        return;
+    }
+
+    if (flashcardSelection === tile) {
+        // Click again to deselect.
+        tile.classList.remove('selected');
+        flashcardSelection = null;
+        return;
+    }
+
+    if (flashcardSelection.dataset.side === tile.dataset.side) {
+        // Move selection within the same column.
+        flashcardSelection.classList.remove('selected');
+        flashcardSelection = tile;
+        tile.classList.add('selected');
+        return;
+    }
+
+    // One tile from each column selected -> evaluate the match.
+    const first = flashcardSelection;
+    const second = tile;
+    flashcardSelection = null;
+
+    if (first.dataset.pairId === second.dataset.pairId) {
+        // Lock the pair in place: stays visible and green, no longer clickable.
+        first.classList.remove('selected');
+        second.classList.remove('selected');
+        first.classList.add('correct', 'matched');
+        second.classList.add('correct', 'matched');
+        checkFlashcardRoundComplete();
+    } else {
+        first.classList.add('wrong');
+        second.classList.add('wrong');
+        first.classList.remove('selected');
+        second.classList.remove('selected');
+        setTimeout(() => {
+            first.classList.remove('wrong');
+            second.classList.remove('wrong');
+        }, 500);
+    }
+}
+
+function checkFlashcardRoundComplete() {
+    const remaining = document.querySelectorAll('#flashcards-board .flashcard-tile:not(.matched)');
+    if (remaining.length === 0) {
+        // Keep the completed (all-green) board visible; show the success note
+        // in the prompt area above it rather than replacing the board.
+        const prompt = document.getElementById('flashcards-prompt');
+        prompt.textContent = 'Round complete!';
+        prompt.classList.add('success');
+        setTimeout(() => {
+            if (currentView === 'flashcards') presentNextFlashcardRound();
+        }, 1200);
     }
 }
