@@ -399,6 +399,35 @@ function formatOllamaError(error) {
   return error.message || 'Ollama request failed';
 }
 
+// Best-effort extraction of a JSON object from arbitrary model output. We do not
+// trust the model to return clean JSON, so if a direct parse fails we grab the
+// substring between the first '{' and the last '}' and try parsing that.
+function extractJsonObject(text) {
+  if (typeof text !== 'string') return null;
+  try { return JSON.parse(text); } catch (_) { /* fall through to brace slicing */ }
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try { return JSON.parse(text.slice(start, end + 1)); } catch (_) { return null; }
+}
+
+// Trim an English definition to at most `max` words.
+function capWords(str, max) {
+  const words = String(str).split(/\s+/).filter(Boolean);
+  return words.slice(0, max).join(' ');
+}
+
+// Normalize a pinyin string for the flashcards: drop any parenthetical notes
+// (both ASCII and full-width parentheses) and the literal "with tone marks"
+// placeholder the model sometimes echoes from the prompt.
+function cleanPinyin(str) {
+  return String(str)
+    .replace(/[\(（][^\)）]*[\)）]/g, ' ') // remove (...) and （...）
+    .replace(/with tone marks/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 ipcMain.handle('translate-text', async (event, text) => {
   try {
     const response = await axios.post(`${config.ollamaEndpoint}/api/generate`, {
@@ -560,6 +589,46 @@ ipcMain.handle('generate-vocab-context', async (event, word) => {
   } catch (error) {
     console.error('Vocab context generation error:', error);
     return { success: false, error: error.message };
+  }
+});
+
+// Generate a structured flashcard dictionary entry via Ollama. Returns the
+// many-to-many (pinyin, meaning) entries for a single Chinese word so the
+// flashcards matching game can pair characters/pinyin/meanings unambiguously.
+ipcMain.handle('get-flashcard-entry', async (event, word) => {
+  try {
+    if (!word || typeof word !== 'string') {
+      return { success: false, error: 'invalid word' };
+    }
+
+    const prompt = `You are a Chinese-English dictionary. For the Chinese word "${word}", list every distinct pronunciation together with its meaning. Respond with ONLY a single JSON object and nothing else: no greeting, no explanation, no markdown, no text before or after it. Use exactly this shape: {"entries":[{"pinyin":"pin yin with tone marks","meaning":"very brief English definition"}]}. Each meaning must be at most 5 words. Include one array item per distinct pronunciation/meaning.`;
+
+    const response = await axios.post(`${config.ollamaEndpoint}/api/generate`, {
+      model: config.ollamaModel,
+      prompt,
+      stream: false,
+      format: 'json'
+    });
+
+    const raw = response.data && response.data.response;
+    if (!raw) return { success: false, error: 'No response received' };
+
+    const parsed = extractJsonObject(raw);
+    if (!parsed) return { success: false, error: 'Could not parse JSON from model output' };
+
+    const rawEntries = Array.isArray(parsed.entries) ? parsed.entries : [];
+    const entries = rawEntries
+      .map(e => ({
+        pinyin: e && typeof e.pinyin === 'string' ? cleanPinyin(e.pinyin) : '',
+        meaning: e && typeof e.meaning === 'string' ? capWords(e.meaning.trim(), 5) : ''
+      }))
+      .filter(e => e.pinyin || e.meaning);
+
+    if (entries.length === 0) return { success: false, error: 'No entries returned' };
+    return { success: true, entries };
+  } catch (error) {
+    console.error('Flashcard entry generation error:', error);
+    return { success: false, error: formatOllamaError(error) };
   }
 });
 

@@ -41,6 +41,9 @@
                     <img class="title-flourish title-flourish-right" src="assets/images/title_flourish.png" alt="">
                 </h1>
                 <div class="menu-buttons">
+                    <button id="flashcards-btn" class="menu-button">
+                        <span class="menu-button-text">Flashcards</span>
+                    </button>
                     <button id="subtitles-translation-btn" class="menu-button">
                         <span class="menu-button-text">Subtitles and Translation</span>
                     </button>
@@ -182,6 +185,35 @@
                     <div id="translation-text" class="text-content"></div>
                 </div>
             </div>
+            </div>
+        </div>
+
+        <!-- Flashcards View -->
+        <div id="flashcards-view" class="view-container flashcards-view" style="display: none;">
+            <div class="flashcards-topbar">
+                <button id="flashcards-back-btn" class="btn btn-back" title="Back to Home" aria-label="Back to Home">
+                    <svg class="back-arrow" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                        <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="currentColor"/>
+                    </svg>
+                </button>
+                <h2 class="flashcards-title">Flashcards</h2>
+                <button id="flashcards-next-btn" class="btn btn-secondary">New Round</button>
+            </div>
+
+            <div class="flashcards-body">
+                <div id="flashcards-prompt" class="flashcards-prompt"></div>
+
+                <div id="flashcards-loading" class="flashcards-loading" style="display: none;">
+                    <div class="loading-spinner"></div>
+                    <p id="flashcards-loading-text">Building round…</p>
+                </div>
+
+                <div id="flashcards-message" class="flashcards-message" style="display: none;"></div>
+
+                <div id="flashcards-board" class="flashcards-board" style="display: none;">
+                    <div id="flashcards-col-left" class="flashcards-col"></div>
+                    <div id="flashcards-col-right" class="flashcards-col"></div>
+                </div>
             </div>
         </div>
 

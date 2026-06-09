@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getTranscriptionStatus: () => ipcRenderer.invoke('get-transcription-status'),
   getPinyin: (text) => ipcRenderer.invoke('get-pinyin', text),
   generateVocabContext: (word) => ipcRenderer.invoke('generate-vocab-context', word),
+  getFlashcardEntry: (word) => ipcRenderer.invoke('get-flashcard-entry', word),
   windowMinimize: () => ipcRenderer.invoke('window-minimize'),
   windowMaximize: () => ipcRenderer.invoke('window-maximize'),
   windowClose: () => ipcRenderer.invoke('window-close'),
