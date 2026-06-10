@@ -164,7 +164,7 @@ body {
     flex-direction: row;
     flex-wrap: wrap;
     gap: 20px;
-    align-items: center;
+    align-items: stretch;
     justify-content: center;
 }
 
@@ -1258,6 +1258,25 @@ body {
     flex-shrink: 0;
 }
 
+/* ===================== Tone Matching View ===================== */
+.tone-matching-view {
+    display: none;
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+}
+
+.tone-matching-topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
 .flashcards-title {
     flex: 1;
     margin: 0;
@@ -1408,4 +1427,317 @@ body {
     overflow: hidden;
     text-overflow: ellipsis;
     text-align: center;
+}
+
+.tone-matching-title {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+/* Top bar with audio device selection */
+.tone-controls-top {
+    flex-shrink: 0;
+    display: flex;
+    align-items: flex-end;
+    gap: 16px;
+    padding: 16px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+}
+
+.tone-controls-top .control-group {
+    min-width: 320px;
+    max-width: 480px;
+}
+
+.tone-controls-top #tone-status {
+    margin-left: auto;
+}
+
+.tone-matching-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    overflow: hidden;
+}
+
+/* Main centered practice area */
+.tone-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8vh;
+    padding: 40px 20px;
+    overflow: hidden;
+}
+
+/* Large character + pinyin display */
+.tone-display {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 40px 64px;
+    min-width: 320px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    box-shadow: 0 10px 40px var(--shadow);
+    transition: transform 0.25s ease;
+}
+
+.tone-display-char {
+    font-size: clamp(7rem, 20vh, 14rem);
+    line-height: 1;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.tone-display-pinyin {
+    font-size: clamp(2rem, 5vh, 3.4rem);
+    color: var(--accent);
+    letter-spacing: 1px;
+    min-height: 1em;
+}
+
+.tone-display.swap-in {
+    animation: tone-swap-in 0.4s ease;
+}
+
+@keyframes tone-swap-in {
+    0% { transform: scale(0.85); opacity: 0; }
+    100% { transform: scale(1); opacity: 1; }
+}
+
+/* Microphone area */
+.tone-mic-area {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 22px;
+}
+
+.tone-mic-btn {
+    --mic-level: 0;
+    position: relative;
+    width: 96px;
+    height: 96px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    background: var(--accent);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 8px 30px rgba(74, 158, 255, 0.45);
+    transition: background 0.2s, box-shadow 0.2s, transform 0.1s;
+}
+
+.tone-mic-btn:hover {
+    background: var(--accent-hover);
+}
+
+.tone-mic-btn:active {
+    transform: scale(0.96);
+}
+
+.tone-mic-btn:disabled {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    box-shadow: none;
+    cursor: not-allowed;
+}
+
+.tone-mic-icon {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Concentric reactive rings (hidden until listening) */
+.tone-mic-ring {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1);
+    pointer-events: none;
+    z-index: 1;
+}
+
+/* When listening: rings pulse, and scale with live mic level via --mic-level */
+.tone-mic-btn.listening .tone-mic-ring-1 {
+    opacity: calc(0.35 + var(--mic-level) * 0.4);
+    transform: translate(-50%, -50%) scale(calc(1.15 + var(--mic-level) * 1.1));
+    transition: transform 0.08s ease-out, opacity 0.08s ease-out;
+    animation: tone-ring-pulse 2s ease-out infinite;
+}
+
+.tone-mic-btn.listening .tone-mic-ring-2 {
+    opacity: calc(0.22 + var(--mic-level) * 0.35);
+    transform: translate(-50%, -50%) scale(calc(1.4 + var(--mic-level) * 1.6));
+    transition: transform 0.1s ease-out, opacity 0.1s ease-out;
+    animation: tone-ring-pulse 2s ease-out 0.5s infinite;
+}
+
+.tone-mic-btn.listening .tone-mic-ring-3 {
+    opacity: calc(0.12 + var(--mic-level) * 0.3);
+    transform: translate(-50%, -50%) scale(calc(1.7 + var(--mic-level) * 2.1));
+    transition: transform 0.12s ease-out, opacity 0.12s ease-out;
+    animation: tone-ring-pulse 2s ease-out 1s infinite;
+}
+
+@keyframes tone-ring-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(74, 158, 255, 0.25); }
+    70% { box-shadow: 0 0 0 18px rgba(74, 158, 255, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(74, 158, 255, 0); }
+}
+
+/* Flash feedback states */
+.tone-mic-btn.flash-green {
+    animation: tone-flash-green 0.9s ease;
+}
+
+.tone-mic-btn.flash-orange {
+    animation: tone-flash-orange 0.9s ease;
+}
+
+@keyframes tone-flash-green {
+    0%, 100% { background: var(--accent); box-shadow: 0 8px 30px rgba(74, 158, 255, 0.45); }
+    25%, 60% { background: var(--success); box-shadow: 0 0 0 14px rgba(76, 175, 80, 0.35); }
+}
+
+@keyframes tone-flash-orange {
+    0%, 100% { background: var(--accent); box-shadow: 0 8px 30px rgba(74, 158, 255, 0.45); }
+    25%, 60% { background: var(--warning); box-shadow: 0 0 0 14px rgba(255, 152, 0, 0.35); }
+}
+
+.tone-mic-hint {
+    color: var(--text-secondary);
+    font-size: 1rem;
+    text-align: center;
+    min-height: 1.2em;
+}
+
+/* Toasts on the right side */
+.tone-toast-container {
+    position: absolute;
+    top: 80px;
+    right: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: 340px;
+    max-width: 80vw;
+    z-index: 500;
+    pointer-events: none;
+}
+
+.tone-toast {
+    pointer-events: auto;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--warning);
+    border-radius: 10px;
+    padding: 14px 16px;
+    box-shadow: 0 8px 26px var(--shadow);
+    color: var(--text-primary);
+    opacity: 0;
+    transform: translateX(40px);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.tone-toast.show {
+    opacity: 1;
+    transform: translateX(0);
+}
+
+.tone-toast.toast-success {
+    border-left-color: var(--success);
+}
+
+.tone-toast-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    font-size: 1rem;
+    margin-bottom: 6px;
+}
+
+.tone-toast-title .tone-toast-pinyin {
+    color: var(--warning);
+    font-weight: 600;
+}
+
+.tone-toast.toast-success .tone-toast-title .tone-toast-pinyin {
+    color: var(--success);
+}
+
+.tone-toast-body {
+    font-size: 0.92rem;
+    line-height: 1.45;
+    color: var(--text-secondary);
+}
+
+.tone-toast-body b {
+    color: var(--text-primary);
+}
+
+/* Skip button (lower right) */
+.tone-skip-btn {
+    position: absolute;
+    right: 24px;
+    bottom: 24px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 22px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    z-index: 400;
+}
+
+.tone-skip-btn:hover {
+    background: var(--bg-tertiary);
+    border-color: var(--accent);
+    color: var(--accent);
+    transform: translateY(-1px);
+}
+
+.tone-skip-btn:active {
+    transform: translateY(0);
+}
+
+.tone-skip-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+}
+
+.tone-matching-empty {
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+    text-align: center;
+    max-width: 420px;
+    line-height: 1.5;
 }

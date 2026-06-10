@@ -132,6 +132,15 @@ function createWindow() {
 
   mainWindow.loadFile('index.html');
 
+  // Allow microphone access for the Tone Matching wave visualizer (getUserMedia).
+  mainWindow.webContents.session.setPermissionRequestHandler((webContents, permission, callback) => {
+    if (permission === 'media' || permission === 'audioCapture') {
+      callback(true);
+      return;
+    }
+    callback(false);
+  });
+
   mainWindow.once('ready-to-show', () => {
     // Restore saved zoom level (default is 1.5x)
     const savedZoom = loadZoomLevel();
@@ -591,6 +600,33 @@ ipcMain.handle('get-pinyin-batch', async (event, words) => {
   }
 });
 
+// Tone-aware pinyin breakdown used by the Tone Matching feature.
+// Returns the display form (tone marks) plus per-syllable arrays with tone
+// numbers and toneless syllables so the renderer can compare pronunciation and
+// tones independently and craft targeted feedback.
+ipcMain.handle('get-pinyin-info', async (event, text) => {
+  try {
+    if (!text || typeof text !== 'string') {
+      return { success: false, error: 'invalid text' };
+    }
+    const symbol = pinyin(text, { toneType: 'symbol', type: 'string', nonZh: 'consecutive' });
+    const numArr = pinyin(text, { toneType: 'num', type: 'array', nonZh: 'consecutive' })
+      .filter((s) => s && s.trim());
+    const noToneArr = pinyin(text, { toneType: 'none', type: 'array', nonZh: 'consecutive' })
+      .filter((s) => s && s.trim());
+    // Extract trailing tone digits (1-4, or 5/0/none -> neutral) per syllable.
+    const tones = numArr.map((syl) => {
+      const m = String(syl).match(/([0-5])\s*$/);
+      const t = m ? parseInt(m[1], 10) : 0;
+      return t === 0 ? 5 : t; // normalize neutral tone to 5
+    });
+    return { success: true, symbol, numArr, noToneArr, tones };
+  } catch (error) {
+    console.error('Pinyin info conversion error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
 // Generate vocab context via Ollama
 ipcMain.handle('generate-vocab-context', async (event, word) => {
   try {
@@ -656,6 +692,22 @@ ipcMain.handle('set-volume-threshold', async (event, threshold) => {
     return { success: true };
   }
   return { success: false };
+});
+
+ipcMain.handle('set-language', async (event, language) => {
+  if (pythonBackend && pythonBackend.stdin.writable) {
+    pythonBackend.stdin.write(JSON.stringify({ action: 'set-language', language }) + '\n');
+    return { success: true };
+  }
+  return { success: false, error: 'Backend not ready' };
+});
+
+ipcMain.handle('set-buffer-duration', async (event, duration) => {
+  if (pythonBackend && pythonBackend.stdin.writable) {
+    pythonBackend.stdin.write(JSON.stringify({ action: 'set-buffer-duration', duration }) + '\n');
+    return { success: true };
+  }
+  return { success: false, error: 'Backend not ready' };
 });
 
 ipcMain.handle('zoom-in', () => {

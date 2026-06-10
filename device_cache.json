@@ -224,7 +224,7 @@
       "is_default": false
     }
   ],
-  "selected_device_id": "{0.0.0.00000000}.{844458bf-55e7-4217-b006-fc09841503d7}",
-  "selected_device_type": "output",
-  "selected_device_name": "[Speaker Output] Speakers (Realtek(R) Audio)"
+  "selected_device_id": 3,
+  "selected_device_type": "input",
+  "selected_device_name": "[Microphone] Mic/Inst (Samson G-Track Pro)"
 }

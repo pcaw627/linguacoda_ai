@@ -14,7 +14,7 @@ let scrollSyncRaf = null; // RequestAnimationFrame ID for scroll sync
 let pendingScrollUpdate = false; // Flag to prevent multiple RAF calls
 
 // View navigation
-let currentView = 'menu'; // 'menu' or 'transcription'
+let currentView = 'menu'; // 'menu', 'transcription', or 'tone-matching'
 let transcriptionViewInitialized = false; // one-time listener/UI setup guard
 
 // Transcription service readiness (server has loaded the SenseVoice model)
@@ -37,10 +37,35 @@ let flashcardBusy = false;     // true while presenting a round (blocks re-entry
 let lastFlashcardError = null; // last entry-fetch error, for user messaging
 let flashcardNextRoundPromise = null; // Promise<roundResult> for the preloaded round
 
+// Most recent audio device list reported by the backend (shared across views)
+let lastAudioDevices = null;
+
+// Tone Matching state
+let toneMatchingInitialized = false; // one-time mic-button wiring guard
+let toneMicDeviceId = null;          // chosen microphone (input) device id
+let toneMicDeviceType = 'input';     // 'input' or 'loopback' for the chosen device
+let toneMicActive = false;           // is the mic currently listening
+let toneTarget = null;               // { word, symbol, numArr, noToneArr, tones }
+let toneMediaStream = null;          // getUserMedia stream used only for the wave animation
+let toneAudioCtx = null;
+let toneAnalyser = null;
+let toneRafId = null;                // requestAnimationFrame id for the level meter
+let toneToastSeq = 0;                // unique id generator for toasts
+let toneBusy = false;               // guard against overlapping result handling
+let toneWrongStreak = 0;            // consecutive incorrect attempts on the current char
+const TONE_MAX_WRONG = 5;          // auto-skip after this many wrong attempts in a row
+// Tone matching practices single syllables, so use a shorter audio buffer for
+// snappier feedback. The transcription view is left untouched and keeps the
+// backend default (config.py BUFFER_MAX_DURATION).
+const TONE_BUFFER_MAX_DURATION = 5.0;   // seconds (~20 chunks @ 4096 samples / 16kHz)
+const DEFAULT_BUFFER_MAX_DURATION = 10.0; // mirrors config.py BUFFER_MAX_DURATION
+
 function showMenuView() {
     document.getElementById('menu-view').style.display = 'flex';
     document.getElementById('transcription-view').style.display = 'none';
     document.getElementById('flashcards-view').style.display = 'none';
+    const toneView = document.getElementById('tone-matching-view');
+    if (toneView) toneView.style.display = 'none';
     currentView = 'menu';
     // Refresh vocab tracker when returning to menu
     initializeVocabTracker();
@@ -50,6 +75,8 @@ function showTranscriptionView() {
     document.getElementById('menu-view').style.display = 'none';
     document.getElementById('transcription-view').style.display = 'flex';
     document.getElementById('flashcards-view').style.display = 'none';
+    const toneView = document.getElementById('tone-matching-view');
+    if (toneView) toneView.style.display = 'none';
     currentView = 'transcription';
 }
 
@@ -57,7 +84,17 @@ function showFlashcardsView() {
     document.getElementById('menu-view').style.display = 'none';
     document.getElementById('transcription-view').style.display = 'none';
     document.getElementById('flashcards-view').style.display = 'flex';
+    const toneView = document.getElementById('tone-matching-view');
+    if (toneView) toneView.style.display = 'none';
     currentView = 'flashcards';
+}
+
+function showToneMatchingView() {
+    document.getElementById('menu-view').style.display = 'none';
+    document.getElementById('transcription-view').style.display = 'none';
+    document.getElementById('flashcards-view').style.display = 'none';
+    document.getElementById('tone-matching-view').style.display = 'flex';
+    currentView = 'tone-matching';
 }
 
 // Initialize
@@ -85,11 +122,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Initialize vocab tracker on the menu page
     initializeVocabTracker();
     
+    // Register the global transcription-result dispatcher up front so it is
+    // active regardless of which feature view the user opens first. It is safe
+    // to call this multiple times — it clears existing listeners before adding.
+    setupElectronListeners();
+
     // Setup menu navigation
     document.getElementById('subtitles-translation-btn').addEventListener('click', () => {
         showTranscriptionView();
         // Initialize transcription view components when first shown
         initializeTranscriptionView();
+    });
+
+    // Tone Matching navigation
+    document.getElementById('tone-matching-btn').addEventListener('click', () => {
+        showToneMatchingView();
+        initializeToneMatchingView();
     });
     
     // Back button (always wire up, it's in the transcription view)
@@ -116,6 +164,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Start preparing the first round in the background as soon as the app opens
     // so a round is "loaded in the chamber" before the user enters Flashcards.
     preloadNextFlashcardRound();
+
+    // Back button for the tone matching view
+    document.getElementById('tone-back-btn').addEventListener('click', async () => {
+        await toneStopListening();
+        showMenuView();
+    });
     
     console.log('Application window ready. Starting main loop...');
 });
@@ -155,10 +209,12 @@ async function initializeTranscriptionView() {
 function startTranscriptionReadyPolling() {
     if (transcriptionReady) {
         if (!isCapturing) updateStatus('Ready', 'ready');
+        updateToneReadinessUI();
         return;
     }
 
     if (!isCapturing) updateStatus('Loading...', 'loading');
+    updateToneReadinessUI();
 
     if (transcriptionReadyPollTimer) {
         clearTimeout(transcriptionReadyPollTimer);
@@ -183,11 +239,37 @@ async function pollTranscriptionReady() {
         // Don't clobber an in-progress capture/stopped status.
         if (!isCapturing) updateStatus('Ready', 'ready');
         updateUI();
+        updateToneReadinessUI();
         return;
     }
 
     if (!isCapturing) updateStatus('Loading...', 'loading');
+    updateToneReadinessUI();
     transcriptionReadyPollTimer = setTimeout(pollTranscriptionReady, 1000);
+}
+
+// Reflect transcription-service readiness on the Tone Matching view: keep the
+// status badge yellow "Loading..." and the mic disabled until the SenseVoice
+// model reports ready, then flip to green "Ready". Reuses the same status
+// component/classes as the transcription view.
+function updateToneReadinessUI() {
+    const statusEl = document.getElementById('tone-status');
+    const micBtn = document.getElementById('tone-mic-btn');
+
+    if (statusEl && !toneMicActive) {
+        if (transcriptionReady) {
+            statusEl.textContent = 'Ready';
+            statusEl.className = 'status status-ready';
+        } else {
+            statusEl.textContent = 'Loading...';
+            statusEl.className = 'status status-loading';
+        }
+    }
+
+    if (micBtn) {
+        // Can't start practicing until the model has finished loading.
+        micBtn.disabled = !transcriptionReady && !toneMicActive;
+    }
 }
 
 // Setup window controls (always available)
@@ -389,7 +471,12 @@ function setupElectronListeners() {
     window.electronAPI.removeAllListeners('audio-devices');
 
     window.electronAPI.onTranscriptionResult((data) => {
-        handleTranscriptionResult(data);
+        // Route results to whichever feature is currently active.
+        if (currentView === 'tone-matching') {
+            handleToneMatchingResult(data);
+        } else {
+            handleTranscriptionResult(data);
+        }
     });
     
     window.electronAPI.onError((error) => {
@@ -398,7 +485,15 @@ function setupElectronListeners() {
     });
     
     window.electronAPI.onAudioDevices((devices) => {
-        populateDeviceSelect(devices);
+        lastAudioDevices = devices;
+        // Transcription view's device <select>.
+        if (document.getElementById('device-select')) {
+            populateDeviceSelect(devices);
+        }
+        // Tone matching view's device <select>.
+        if (document.getElementById('tone-device-select')) {
+            populateToneDeviceSelect(devices);
+        }
     });
 }
 
@@ -2110,4 +2205,560 @@ function checkFlashcardRoundComplete() {
             if (currentView === 'flashcards') presentNextFlashcardRound();
         }, 1200);
     }
+}
+
+// ========== Tone Matching ==========
+
+// Entry point when the user opens the Tone Matching view.
+async function initializeToneMatchingView() {
+    const micBtn = document.getElementById('tone-mic-btn');
+
+    // Wire the mic toggle + device controls exactly once.
+    if (!toneMatchingInitialized) {
+        micBtn.addEventListener('click', toneToggleMic);
+
+        const deviceSelect = document.getElementById('tone-device-select');
+        if (deviceSelect) {
+            deviceSelect.addEventListener('change', (e) => {
+                const option = e.target.options[e.target.selectedIndex];
+                toneMicDeviceId = e.target.value;
+                toneMicDeviceType = (option && option.dataset.type) || 'input';
+            });
+        }
+
+        const refreshBtn = document.getElementById('tone-refresh-devices');
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', () => {
+                window.electronAPI.getAudioDevices(true);
+            });
+        }
+
+        const skipBtn = document.getElementById('tone-skip-btn');
+        if (skipBtn) {
+            skipBtn.addEventListener('click', () => { setNewToneCharacter(); });
+        }
+
+        toneMatchingInitialized = true;
+    }
+
+    // Always start in the "off" state when entering the view.
+    toneMicActive = false;
+    toneSetListeningUI(false);
+
+    // Reflect transcription-service readiness (reuses the shared health polling).
+    updateToneReadinessUI();
+    startTranscriptionReadyPolling();
+
+    // Make sure the HSK dictionary is loaded (vocab tracker may not have run yet).
+    if (Object.keys(allHskWords).length === 0) {
+        try {
+            const result = await window.electronAPI.getHskDictionary();
+            if (result.success && result.words) allHskWords = result.words;
+        } catch (err) {
+            console.error('Tone matching: failed to load HSK dictionary', err);
+        }
+    }
+
+    // Resolve a microphone device for the Python transcription backend.
+    pickToneMicDevice();
+
+    // Pick the first character to practice.
+    await setNewToneCharacter();
+}
+
+// Return the list of words the learner has already encountered in the tracker.
+function toneGetSeenWords() {
+    return Object.keys(seenVocab).filter((w) => seenVocab[w] > 0);
+}
+
+// Populate the tone matching device <select> and resolve the active device.
+// Preserves the user's current selection across refreshes when possible.
+function populateToneDeviceSelect(devices) {
+    const select = document.getElementById('tone-device-select');
+    if (!select) return;
+
+    const previousValue = toneMicDeviceId;
+    select.innerHTML = '';
+
+    // Tone matching practices the learner's own speech, so only list microphones
+    // (input devices) here — speaker/loopback outputs are intentionally excluded.
+    if (!devices || !devices.input || devices.input.length === 0) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No microphones found';
+        select.appendChild(option);
+        toneMicDeviceId = null;
+        return;
+    }
+
+    devices.input.forEach((device) => {
+        const option = document.createElement('option');
+        option.value = device.id;
+        option.textContent = device.name;
+        option.dataset.type = device.type || 'input';
+        select.appendChild(option);
+    });
+
+    // Decide which option to select.
+    let selectedIndex = 0;
+    let matched = false;
+
+    // 1) Keep the user's previous selection if it still exists.
+    if (previousValue != null && previousValue !== '') {
+        for (let i = 0; i < select.options.length; i++) {
+            if (select.options[i].value == previousValue) { selectedIndex = i; matched = true; break; }
+        }
+    }
+    // 2) Otherwise prefer the cached default if it's a microphone.
+    if (!matched && devices.defaultDeviceType === 'input' && devices.defaultDeviceId != null) {
+        for (let i = 0; i < select.options.length; i++) {
+            if (select.options[i].value == devices.defaultDeviceId) { selectedIndex = i; matched = true; break; }
+        }
+    }
+
+    if (select.options.length > 0) {
+        select.selectedIndex = selectedIndex;
+        const selectedOption = select.options[selectedIndex];
+        toneMicDeviceId = selectedOption.value;
+        toneMicDeviceType = selectedOption.dataset.type || 'input';
+    }
+}
+
+// Ask the backend for the device list (populated via the 'audio-devices' event).
+async function pickToneMicDevice() {
+    try {
+        await window.electronAPI.getAudioDevices(false);
+    } catch (err) {
+        console.error('Tone matching: getAudioDevices failed', err);
+    }
+
+    // If devices were already cached from a previous request, populate now.
+    if (lastAudioDevices) {
+        populateToneDeviceSelect(lastAudioDevices);
+    }
+}
+
+// Choose a new random character from the seen-vocab pool and display it.
+async function setNewToneCharacter() {
+    const display = document.getElementById('tone-display');
+    const charEl = document.getElementById('tone-display-char');
+    const pinyinEl = document.getElementById('tone-display-pinyin');
+    const hintEl = document.getElementById('tone-mic-hint');
+
+    // A fresh character always resets the wrong-answer streak.
+    toneWrongStreak = 0;
+
+    const seen = toneGetSeenWords();
+
+    if (seen.length === 0) {
+        toneTarget = null;
+        charEl.textContent = '—';
+        pinyinEl.innerHTML = '';
+        if (hintEl) {
+            hintEl.innerHTML = '<span class="tone-matching-empty">No vocab seen yet. Use <b>Subtitles and Translation</b> to encounter some words first, then come back to practice your tones.</span>';
+        }
+        return;
+    }
+
+    // Avoid immediately repeating the current character when possible.
+    let word = seen[Math.floor(Math.random() * seen.length)];
+    if (seen.length > 1 && toneTarget && word === toneTarget.word) {
+        word = seen[Math.floor(Math.random() * seen.length)];
+    }
+
+    charEl.textContent = word;
+    pinyinEl.textContent = '…';
+
+    // Fetch the tone-aware pinyin breakdown for the target.
+    let info = null;
+    try {
+        const result = await window.electronAPI.getPinyinInfo(word);
+        if (result && result.success) info = result;
+    } catch (err) {
+        console.error('Tone matching: getPinyinInfo failed', err);
+    }
+
+    if (!info) {
+        // Fall back to the plain pinyin string if the detailed call failed.
+        const fallback = pinyinCache[word] || word;
+        pinyinEl.textContent = fallback;
+        toneTarget = { word, symbol: fallback, numArr: [], noToneArr: [], tones: [] };
+    } else {
+        pinyinEl.textContent = info.symbol;
+        toneTarget = {
+            word,
+            symbol: info.symbol,
+            numArr: info.numArr,
+            noToneArr: info.noToneArr,
+            tones: info.tones,
+        };
+    }
+
+    // Re-trigger the swap-in animation.
+    display.classList.remove('swap-in');
+    void display.offsetWidth; // force reflow so the animation can restart
+    display.classList.add('swap-in');
+
+    if (hintEl && toneMicActive) {
+        hintEl.textContent = 'Listening… say the character above';
+    } else if (hintEl) {
+        hintEl.textContent = 'Tap the mic, then say the character above';
+    }
+}
+
+// Toggle the persistent microphone on/off.
+async function toneToggleMic() {
+    if (toneMicActive) {
+        await toneStopListening();
+    } else {
+        await toneStartListening();
+    }
+}
+
+async function toneStartListening() {
+    if (toneMicActive) return;
+
+    // Wait for the transcription service to finish loading.
+    if (!transcriptionReady) {
+        showToneToast('Still loading', 'The speech model is still loading. Please wait for the status to show <b>Ready</b>.', false);
+        return;
+    }
+
+    if (!toneTarget) {
+        // Nothing to practice yet.
+        return;
+    }
+
+    if (!toneMicDeviceId) {
+        await pickToneMicDevice();
+        if (!toneMicDeviceId) {
+            showToneToast('No microphone', 'Could not find a microphone input device. Please connect a mic and reopen this view.', false);
+            return;
+        }
+    }
+
+    // Force the transcription language to Mandarin Chinese so tone matching
+    // always evaluates Chinese pinyin rather than auto-detecting another language.
+    try {
+        await window.electronAPI.setLanguage('zh');
+    } catch (err) {
+        console.error('Tone matching: setLanguage failed', err);
+    }
+
+    // Use a shorter audio buffer so single-syllable attempts are transcribed
+    // quickly. (The transcription view keeps the default buffer length.)
+    try {
+        await window.electronAPI.setBufferDuration(TONE_BUFFER_MAX_DURATION);
+    } catch (err) {
+        console.error('Tone matching: setBufferDuration failed', err);
+    }
+
+    // Start the Python backend capturing from the selected device.
+    const result = await window.electronAPI.startCapture(toneMicDeviceId, toneMicDeviceType);
+    if (!result || !result.success) {
+        showToneToast('Mic error', `Failed to start the microphone: ${(result && result.error) || 'unknown error'}`, false);
+        return;
+    }
+
+    toneMicActive = true;
+    toneSetListeningUI(true);
+
+    // Start the local visualizer (independent getUserMedia stream).
+    toneStartVisualizer();
+}
+
+async function toneStopListening() {
+    // Always tear down the visualizer.
+    toneStopVisualizer();
+
+    if (toneMicActive) {
+        try {
+            await window.electronAPI.stopCapture();
+        } catch (err) {
+            console.error('Tone matching: stopCapture failed', err);
+        }
+        // Restore auto language detection so other views aren't locked to Chinese.
+        try {
+            await window.electronAPI.setLanguage('auto');
+        } catch (err) {
+            console.error('Tone matching: resetLanguage failed', err);
+        }
+        // Restore the default audio buffer length for the transcription view.
+        try {
+            await window.electronAPI.setBufferDuration(DEFAULT_BUFFER_MAX_DURATION);
+        } catch (err) {
+            console.error('Tone matching: resetBufferDuration failed', err);
+        }
+    }
+
+    toneMicActive = false;
+    toneSetListeningUI(false);
+}
+
+// Reflect listening state on the mic button + hint text.
+function toneSetListeningUI(listening) {
+    const micBtn = document.getElementById('tone-mic-btn');
+    const hintEl = document.getElementById('tone-mic-hint');
+    if (!micBtn) return;
+
+    micBtn.classList.toggle('listening', listening);
+    micBtn.setAttribute('aria-pressed', listening ? 'true' : 'false');
+    micBtn.style.setProperty('--mic-level', '0');
+
+    // Lock device selection while actively capturing (matches transcription view).
+    const deviceSelect = document.getElementById('tone-device-select');
+    const refreshBtn = document.getElementById('tone-refresh-devices');
+    if (deviceSelect) deviceSelect.disabled = listening;
+    if (refreshBtn) refreshBtn.disabled = listening;
+
+    // Reflect capture state on the shared status badge.
+    const statusEl = document.getElementById('tone-status');
+    if (statusEl) {
+        if (listening) {
+            statusEl.textContent = 'Listening...';
+            statusEl.className = 'status status-capturing';
+        } else if (transcriptionReady) {
+            statusEl.textContent = 'Ready';
+            statusEl.className = 'status status-ready';
+        } else {
+            statusEl.textContent = 'Loading...';
+            statusEl.className = 'status status-loading';
+        }
+    }
+
+    if (hintEl && toneTarget) {
+        hintEl.textContent = listening
+            ? 'Listening… say the character above'
+            : 'Tap the mic, then say the character above';
+    }
+}
+
+// Use getUserMedia + an AnalyserNode purely to animate the waves with the live
+// microphone level. Transcription itself is handled by the Python backend.
+async function toneStartVisualizer() {
+    try {
+        toneMediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        toneAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const source = toneAudioCtx.createMediaStreamSource(toneMediaStream);
+        toneAnalyser = toneAudioCtx.createAnalyser();
+        toneAnalyser.fftSize = 512;
+        source.connect(toneAnalyser);
+
+        const buffer = new Uint8Array(toneAnalyser.frequencyBinCount);
+        const micBtn = document.getElementById('tone-mic-btn');
+        let smoothed = 0;
+
+        const tick = () => {
+            toneAnalyser.getByteTimeDomainData(buffer);
+            // Compute RMS deviation from the 128 midpoint.
+            let sum = 0;
+            for (let i = 0; i < buffer.length; i++) {
+                const v = (buffer[i] - 128) / 128;
+                sum += v * v;
+            }
+            const rms = Math.sqrt(sum / buffer.length);
+            // Scale + clamp into a pleasant 0..1 range for the rings.
+            const level = Math.min(1, rms * 3.2);
+            // Smooth so the waves feel organic rather than jittery.
+            smoothed = smoothed * 0.8 + level * 0.2;
+            if (micBtn) micBtn.style.setProperty('--mic-level', smoothed.toFixed(3));
+            toneRafId = requestAnimationFrame(tick);
+        };
+        tick();
+    } catch (err) {
+        // Visualizer is non-essential; transcription still works without it.
+        console.warn('Tone matching: visualizer unavailable', err);
+    }
+}
+
+function toneStopVisualizer() {
+    if (toneRafId) {
+        cancelAnimationFrame(toneRafId);
+        toneRafId = null;
+    }
+    if (toneMediaStream) {
+        toneMediaStream.getTracks().forEach((t) => t.stop());
+        toneMediaStream = null;
+    }
+    if (toneAudioCtx) {
+        try { toneAudioCtx.close(); } catch (e) { /* already closed */ }
+        toneAudioCtx = null;
+    }
+    toneAnalyser = null;
+    const micBtn = document.getElementById('tone-mic-btn');
+    if (micBtn) micBtn.style.setProperty('--mic-level', '0');
+}
+
+// Handle a transcription result while the Tone Matching view is active.
+async function handleToneMatchingResult(data) {
+    if (!toneMicActive || !toneTarget) return;
+    if (toneBusy) return; // ignore overlapping results while we evaluate one
+
+    const transcription = data && data.transcription;
+    if (!transcription || !transcription.trim()) return;
+
+    // Keep only Chinese characters from what was heard.
+    const spokenChars = (transcription.match(/[\u4e00-\u9fff]/g) || []).join('');
+    if (!spokenChars) return; // no Chinese detected; wait for the next utterance
+
+    toneBusy = true;
+    try {
+        let spoken = null;
+        try {
+            const result = await window.electronAPI.getPinyinInfo(spokenChars);
+            if (result && result.success) spoken = result;
+        } catch (err) {
+            console.error('Tone matching: getPinyinInfo (spoken) failed', err);
+        }
+        if (!spoken) return;
+
+        const verdict = compareTonePinyin(toneTarget, spoken);
+
+        if (verdict.match) {
+            toneWrongStreak = 0;
+            toneFlash('green');
+            showToneToast(`Nice! ${toneTarget.symbol}`, `That matched <b>${toneTarget.word}</b>. Here's a new one.`, true);
+            // Advance to a new character after the green flash.
+            setTimeout(() => { setNewToneCharacter(); }, 700);
+        } else {
+            toneWrongStreak++;
+            toneFlash('orange');
+
+            if (toneWrongStreak >= TONE_MAX_WRONG) {
+                // Too many misses in a row — move on to a new character.
+                showToneToast('Let\'s move on', `That's ${TONE_MAX_WRONG} tries on <b>${toneTarget.symbol}</b>. Skipping to a new character — you can always revisit this one later.`, false, spoken.symbol);
+                setTimeout(() => { setNewToneCharacter(); }, 900);
+            } else {
+                const remaining = TONE_MAX_WRONG - toneWrongStreak;
+                const suffix = ` <span style="opacity:0.8;">(${remaining} more ${remaining === 1 ? 'try' : 'tries'} before skipping)</span>`;
+                showToneToast('Keep practicing', verdict.feedback + suffix, false, spoken.symbol);
+            }
+        }
+    } finally {
+        // Brief cooldown so a single utterance doesn't trigger multiple verdicts.
+        setTimeout(() => { toneBusy = false; }, 900);
+    }
+}
+
+// Compare the spoken pinyin against the target. Returns { match, feedback }.
+function compareTonePinyin(target, spoken) {
+    const tNoTone = (target.noToneArr || []).map((s) => s.toLowerCase());
+    const tTones = target.tones || [];
+    const sNoTone = (spoken.noToneArr || []).map((s) => s.toLowerCase());
+    const sTones = spoken.tones || [];
+
+    // If we lack a structured target breakdown, fall back to a string compare.
+    if (tNoTone.length === 0) {
+        const match = (spoken.symbol || '').replace(/\s+/g, '') === (target.symbol || '').replace(/\s+/g, '');
+        return { match, feedback: buildToneFeedback(target, spoken, null) };
+    }
+
+    // The learner may say extra surrounding syllables; look for the target as a
+    // contiguous run inside what was heard (by base syllable).
+    const startIdx = findSubsequenceStart(sNoTone, tNoTone);
+
+    if (startIdx === -1) {
+        // Wrong sound entirely.
+        return { match: false, feedback: buildToneFeedback(target, spoken, null) };
+    }
+
+    // Same base syllables — now compare tones for that aligned window.
+    const alignedTones = sTones.slice(startIdx, startIdx + tTones.length);
+    let toneMismatchIndex = -1;
+    for (let i = 0; i < tTones.length; i++) {
+        if (alignedTones[i] !== tTones[i]) {
+            toneMismatchIndex = i;
+            break;
+        }
+    }
+
+    if (toneMismatchIndex === -1) {
+        return { match: true, feedback: '' };
+    }
+
+    return {
+        match: false,
+        feedback: buildToneFeedback(target, spoken, { index: toneMismatchIndex, expected: tTones[toneMismatchIndex], got: alignedTones[toneMismatchIndex] }),
+    };
+}
+
+// Find where `needle` (base syllables) starts within `haystack`, or -1.
+function findSubsequenceStart(haystack, needle) {
+    if (needle.length === 0) return -1;
+    for (let i = 0; i + needle.length <= haystack.length; i++) {
+        let ok = true;
+        for (let j = 0; j < needle.length; j++) {
+            if (haystack[i + j] !== needle[j]) { ok = false; break; }
+        }
+        if (ok) return i;
+    }
+    return -1;
+}
+
+// Human-readable description of a Mandarin tone.
+function describeTone(n) {
+    switch (n) {
+        case 1: return { name: '1st tone (high & level)', tip: 'Hold it high and flat, like singing a steady note.' };
+        case 2: return { name: '2nd tone (rising)', tip: 'Glide upward, like asking “huh?”.' };
+        case 3: return { name: '3rd tone (dipping)', tip: 'Dip your voice low, then let it rise back up.' };
+        case 4: return { name: '4th tone (falling)', tip: 'Drop sharply from high to low, like a firm command.' };
+        default: return { name: 'neutral tone', tip: 'Say it light, short and unstressed.' };
+    }
+}
+
+// Craft corrective feedback text for the mismatch toast.
+function buildToneFeedback(target, spoken, toneInfo) {
+    const heard = spoken && spoken.symbol ? spoken.symbol : '(unclear)';
+
+    if (toneInfo) {
+        // Same syllable, wrong tone — give targeted tone coaching.
+        const want = describeTone(toneInfo.expected);
+        const got = describeTone(toneInfo.got);
+        const syl = (target.noToneArr && target.noToneArr[toneInfo.index]) || '';
+        return `Right sound, wrong tone. I heard <b>${heard}</b> (${got.name}), but <b>${target.symbol}</b> needs the <b>${want.name}</b>${syl ? ` on “${syl}”` : ''}. ${want.tip}`;
+    }
+
+    // Wrong pronunciation overall.
+    return `I heard <b>${heard}</b>, but the target is <b>${target.symbol}</b> (${target.word}). Listen for the initial and final sounds, then try again slowly.`;
+}
+
+// Flash the mic button green (match) or orange (mismatch).
+function toneFlash(type) {
+    const micBtn = document.getElementById('tone-mic-btn');
+    if (!micBtn) return;
+    const cls = type === 'green' ? 'flash-green' : 'flash-orange';
+    micBtn.classList.remove('flash-green', 'flash-orange');
+    void micBtn.offsetWidth; // restart animation if same class re-applied
+    micBtn.classList.add(cls);
+    setTimeout(() => micBtn.classList.remove(cls), 950);
+}
+
+// Show a feedback toast on the right side. `success` toggles the green accent.
+function showToneToast(title, bodyHtml, success, pinyin) {
+    const container = document.getElementById('tone-toast-container');
+    if (!container) return;
+
+    const id = ++toneToastSeq;
+    const toast = document.createElement('div');
+    toast.className = `tone-toast${success ? ' toast-success' : ''}`;
+    toast.dataset.id = String(id);
+    toast.innerHTML = `
+        <div class="tone-toast-title">${title}${pinyin ? ` <span class="tone-toast-pinyin">${pinyin}</span>` : ''}</div>
+        <div class="tone-toast-body">${bodyHtml}</div>
+    `;
+    container.appendChild(toast);
+
+    // Animate in.
+    requestAnimationFrame(() => toast.classList.add('show'));
+
+    // Limit how many toasts stack up.
+    while (container.children.length > 4) {
+        container.removeChild(container.firstChild);
+    }
+
+    // Auto-dismiss.
+    setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 350);
+    }, success ? 3000 : 7000);
 }
