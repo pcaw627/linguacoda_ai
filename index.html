@@ -53,6 +53,16 @@
                 </div>
             </div>
 
+            <!-- Account / cloud sync status -->
+            <div class="account-bar" id="account-bar">
+                <span class="account-email" id="account-email">Checking account…</span>
+                <span class="account-sync-status" id="account-sync-status"></span>
+                <div class="account-actions">
+                    <button id="account-sign-in-btn" class="account-btn" type="button">Sign in with Google</button>
+                    <button id="account-sign-out-btn" class="account-btn account-btn-secondary" type="button" style="display: none;">Sign out</button>
+                </div>
+            </div>
+
             <!-- Vocab Tracker -->
             <div class="vocab-tracker" id="vocab-tracker">
                 <div class="vocab-tracker-header">
@@ -328,6 +338,7 @@
         </div>
     </div>
 
+    <script src="vocab-sync.js"></script>
     <script src="renderer.js"></script>
 </body>
 </html>

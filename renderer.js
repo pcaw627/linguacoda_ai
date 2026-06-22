@@ -121,6 +121,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     
     // Initialize vocab tracker on the menu page
     initializeVocabTracker();
+
+    // Cloud vocab sync + account UI
+    if (window.VocabSync) {
+        window.VocabSync.initVocabSync({
+            getSeenVocab: () => seenVocab,
+            setSeenVocab: (merged) => {
+                seenVocab = merged;
+                localStorage.setItem('seenVocab', JSON.stringify(seenVocab));
+            },
+            refreshVocabUI: () => initializeVocabTracker(),
+        });
+        window.VocabSync.setupAccountUI();
+
+        if (window.electronAPI.onAuthStateChanged) {
+            window.electronAPI.onAuthStateChanged(async () => {
+                await window.VocabSync.pullAndMergeOnLogin();
+                window.VocabSync.updateAccountStatusUI();
+            });
+        }
+    }
     
     // Register the global transcription-result dispatcher up front so it is
     // active regardless of which feature view the user opens first. It is safe
@@ -746,8 +766,13 @@ function trackVocabFromText(text) {
         }
         if (!matched) i++;
     }
-    // Persist to localStorage
+    // Persist to localStorage draft (offline backup)
     localStorage.setItem('seenVocab', JSON.stringify(seenVocab));
+
+    if (window.VocabSync) {
+        window.VocabSync.markVocabDirty();
+        window.VocabSync.scheduleDebouncedSync();
+    }
 }
 
 // Translate text
