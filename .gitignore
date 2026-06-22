@@ -53,3 +53,8 @@ models/
 node_modules/
 .transcription_server.token
 device_cache.json
+
+# Cloud API (services/cloud-api)
+services/cloud-api/node_modules/
+services/cloud-api/.next/
+services/cloud-api/.env.local

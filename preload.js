@@ -26,6 +26,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   windowMinimize: () => ipcRenderer.invoke('window-minimize'),
   windowMaximize: () => ipcRenderer.invoke('window-maximize'),
   windowClose: () => ipcRenderer.invoke('window-close'),
+
+  // Cloud auth & vocab sync
+  signIn: () => ipcRenderer.invoke('sign-in'),
+  signOut: () => ipcRenderer.invoke('sign-out'),
+  getAuthStatus: () => ipcRenderer.invoke('get-auth-status'),
+  pingCloudHealth: () => ipcRenderer.invoke('ping-cloud-health'),
+  vocabSyncPull: () => ipcRenderer.invoke('vocab-sync-pull'),
+  vocabSyncPush: (seenVocab) => ipcRenderer.invoke('vocab-sync-push', seenVocab),
+  notifyVocabSyncComplete: () => ipcRenderer.invoke('vocab-sync-complete'),
+  onVocabSyncRequest: (callback) => {
+    ipcRenderer.on('request-vocab-sync', () => callback());
+  },
+  onAuthStateChanged: (callback) => {
+    ipcRenderer.on('auth-state-changed', (_event, data) => callback(data));
+  },
   
   // Listeners
   onTranscriptionResult: (callback) => {

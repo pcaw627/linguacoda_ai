@@ -1,9 +1,10 @@
-const { app, BrowserWindow, ipcMain, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const axios = require('axios');
 const { pinyin } = require('pinyin-pro');
+const cloudApi = require('./cloud-api-client');
 
 // Zoom level persistence
 const zoomFile = path.join(__dirname, '.zoom-level');
@@ -26,6 +27,70 @@ let mainWindow;
 let pythonBackend = null;
 let transcriptionServer = null;
 const config = require('./electron-config.json');
+
+let allowAppClose = false;
+let pendingProtocolUrl = null;
+let lastCloudHealth = null;
+
+// Register custom protocol for OAuth callback (linguacoda://auth/callback?code=...)
+if (process.defaultApp) {
+  if (process.argv.length >= 2) {
+    app.setAsDefaultProtocolClient('linguacoda', process.execPath, [path.resolve(process.argv[1])]);
+  }
+} else {
+  app.setAsDefaultProtocolClient('linguacoda');
+}
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (_event, commandLine) => {
+    const protocolUrl = commandLine.find((arg) => arg.startsWith('linguacoda://'));
+    if (protocolUrl) {
+      handleProtocolCallback(protocolUrl);
+    }
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
+async function handleProtocolCallback(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== 'auth' || !parsed.pathname.startsWith('/callback')) {
+      return;
+    }
+
+    const code = parsed.searchParams.get('code');
+    if (!code) {
+      console.error('[CloudAuth] Protocol callback missing code');
+      return;
+    }
+
+    if (!mainWindow) {
+      pendingProtocolUrl = url;
+      return;
+    }
+
+    const result = await cloudApi.exchangeDesktopCode(config, code);
+    cloudApi.saveApiToken(result.token, result.email);
+
+    mainWindow.webContents.send('auth-state-changed', { signedIn: true, email: result.email });
+    console.log('[CloudAuth] Signed in via Google');
+  } catch (err) {
+    console.error('[CloudAuth] Protocol callback failed:', err.message);
+  }
+}
+
+if (process.platform === 'darwin') {
+  app.on('open-url', (event, url) => {
+    event.preventDefault();
+    handleProtocolCallback(url);
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiting-for-audio ping-pong animation
@@ -148,6 +213,12 @@ function createWindow() {
     mainWindow.show();
     console.log('Language Learning Assistant - Starting');
     console.log('='.repeat(60));
+
+    if (pendingProtocolUrl) {
+      const url = pendingProtocolUrl;
+      pendingProtocolUrl = null;
+      handleProtocolCallback(url);
+    }
   });
 
   // Save zoom level whenever it changes
@@ -156,10 +227,15 @@ function createWindow() {
     saveZoomLevel(currentZoom);
   });
 
-  mainWindow.on('close', () => {
+  mainWindow.on('close', (e) => {
     // Save zoom level before window closes
     if (mainWindow && mainWindow.webContents) {
       saveZoomLevel(mainWindow.webContents.getZoomLevel());
+    }
+
+    if (!allowAppClose && cloudApi.loadApiToken() && cloudApi.getCloudApiBaseUrl(config)) {
+      e.preventDefault();
+      mainWindow.webContents.send('request-vocab-sync');
     }
   });
 
@@ -753,9 +829,108 @@ ipcMain.handle('window-close', () => {
   if (mainWindow) mainWindow.close();
 });
 
+// ── Cloud auth & vocab sync ─────────────────────────────────────────────────
+
+ipcMain.handle('sign-in', async () => {
+  const signInUrl = cloudApi.buildSignInUrl(config);
+  if (!signInUrl) {
+    return { success: false, error: 'cloudApiBaseUrl is not configured' };
+  }
+
+  try {
+    await shell.openExternal(signInUrl);
+    return { success: true, message: 'Complete sign-in in your browser' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('sign-out', async () => {
+  cloudApi.clearAuth();
+  return { success: true };
+});
+
+ipcMain.handle('get-auth-status', async () => {
+  const token = cloudApi.loadApiToken();
+  const meta = cloudApi.loadAuthMeta();
+  const cloudConfigured = !!cloudApi.getCloudApiBaseUrl(config);
+
+  let cloudReachable = lastCloudHealth?.ok ?? null;
+  if (cloudConfigured && cloudReachable === null) {
+    lastCloudHealth = await cloudApi.pingCloudHealth(config);
+    cloudReachable = lastCloudHealth.ok;
+  }
+
+  return {
+    signedIn: !!token,
+    email: meta?.email || null,
+    cloudConfigured,
+    cloudReachable,
+    cloudApiBaseUrl: cloudApi.getCloudApiBaseUrl(config),
+  };
+});
+
+ipcMain.handle('ping-cloud-health', async () => {
+  lastCloudHealth = await cloudApi.pingCloudHealth(config);
+  return lastCloudHealth;
+});
+
+ipcMain.handle('vocab-sync-pull', async () => {
+  try {
+    const response = await cloudApi.cloudApiFetch(config, '/api/vocab');
+    if (response.status === 401) {
+      return { success: false, error: 'Session expired — sign in again' };
+    }
+    if (response.status !== 200) {
+      return { success: false, error: `Pull failed (${response.status})` };
+    }
+    return {
+      success: true,
+      seenVocab: response.data.seenVocab || {},
+      updatedAt: response.data.updatedAt,
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('vocab-sync-push', async (_event, seenVocab) => {
+  try {
+    const response = await cloudApi.cloudApiFetch(config, '/api/vocab', {
+      method: 'PUT',
+      body: { seenVocab },
+    });
+    if (response.status === 401) {
+      return { success: false, error: 'Session expired — sign in again' };
+    }
+    if (response.status !== 200) {
+      return { success: false, error: `Push failed (${response.status})` };
+    }
+    return {
+      success: true,
+      seenVocab: response.data.seenVocab,
+      updatedAt: response.data.updatedAt,
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('vocab-sync-complete', () => {
+  allowAppClose = true;
+  if (mainWindow) mainWindow.close();
+});
+
 // App lifecycle
 app.whenReady().then(async () => {
   createWindow();
+
+  if (process.platform === 'win32') {
+    const protocolUrl = process.argv.find((arg) => arg.startsWith('linguacoda://'));
+    if (protocolUrl) {
+      handleProtocolCallback(protocolUrl);
+    }
+  }
 
   // Set up application menu with zoom accelerators (works even with frame:false)
   const menuTemplate = [
@@ -869,7 +1044,13 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
+  if (!allowAppClose && cloudApi.loadApiToken() && cloudApi.getCloudApiBaseUrl(config) && mainWindow) {
+    e.preventDefault();
+    mainWindow.webContents.send('request-vocab-sync');
+    return;
+  }
+
   if (pythonBackend) {
     pythonBackend.kill();
   }
