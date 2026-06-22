@@ -224,7 +224,7 @@
       "is_default": false
     }
   ],
-  "selected_device_id": 3,
+  "selected_device_id": 0,
   "selected_device_type": "input",
-  "selected_device_name": "[Microphone] Mic/Inst (Samson G-Track Pro)"
+  "selected_device_name": "[Microphone] Microsoft Sound Mapper - Input"
 }

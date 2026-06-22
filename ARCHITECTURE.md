@@ -1,257 +1,593 @@
 # LinguaCoda AI — Architecture
 
-This document describes the high-level design of the LinguaCoda desktop app: how audio is captured, transcribed, translated, displayed, and extended with language-learning features.
+This document describes the system design for LinguaCoda: the current Electron desktop app, the target production deployment, and how the two coexist during migration.
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Production Target Architecture](#production-target-architecture)
+3. [Recommended Additions & Modifications](#recommended-additions--modifications)
+4. [Component Responsibilities](#component-responsibilities)
+5. [Authentication & Sessions](#authentication--sessions)
+6. [Data Model & Vocab Sync](#data-model--vocab-sync)
+7. [Home Compute Gateway (Remote Backend)](#home-compute-gateway-remote-backend)
+8. [Web Frontend (Vercel)](#web-frontend-vercel)
+9. [Security](#security)
+10. [Concurrency & Rate Limiting](#concurrency--rate-limiting)
+11. [Desktop Client (Electron) — Current & Future](#desktop-client-electron--current--future)
+12. [AI Components](#ai-components)
+13. [Data Flows](#data-flows)
+14. [Configuration & Persistence](#configuration--persistence)
+15. [Migration Phases](#migration-phases)
+16. [Error Handling & Resilience](#error-handling--resilience)
+
+---
 
 ## Overview
 
+LinguaCoda is a language-learning app centered on **real-time transcription**, **translation**, **semantic alignment**, and an **HSK vocab tracker**.
+
+Today the project is an **Electron desktop app** where all compute (ASR, alignment, LLM translation) runs locally on the user's machine. The production target splits the system into three tiers:
+
+| Tier | Host | Role |
+|------|------|------|
+| **Web client** | Vercel | Browser UI, Google login, per-user sessions, vocab persistence |
+| **Cloud API** | Vercel (serverless) or managed DB host | Auth callbacks, vocab read/write, optional BFF proxy to home compute |
+| **Home compute gateway** | Personal PC | GPU/CPU-heavy AI: SenseVoice ASR, SimAlign, Ollama translation |
+
+```mermaid
+flowchart TB
+    subgraph clients [Clients]
+        Browser[Web Browser on Vercel]
+        Electron[Electron Desktop optional]
+    end
+
+    subgraph cloud [Cloud - Vercel + DB]
+        WebApp[Next.js App]
+        Auth[Auth.js - Google OAuth]
+        VocabAPI[Vocab API Routes]
+        DB[(PostgreSQL)]
+    end
+
+    subgraph home [Home PC - Remote Mode]
+        Gateway[Compute Gateway]
+        TS[Transcription Server]
+        Ollama[Ollama LLM]
+    end
+
+    Browser --> WebApp
+    Electron --> WebApp
+    Electron --> Gateway
+    WebApp --> Auth
+    WebApp --> VocabAPI
+    VocabAPI --> DB
+    WebApp -.->|short-lived token| Gateway
+    Gateway --> TS
+    Gateway --> Ollama
+```
+
+**Why split this way:** SenseVoice, SimAlign/XLM-R, and Ollama are too heavy for Vercel serverless and require local GPU/CPU. User accounts and vocab state belong in a managed database. The browser cannot access loopback audio capture — that remains an Electron-only capability.
+
+---
+
+## Production Target Architecture
+
+### Goals (from product requirements)
+
+1. **Remote backend flag** — run dedicated AI backend on a personal PC, reachable from the public internet, with protection (tunneling, rate limits) and support for multiple concurrent frontend sessions.
+2. **Web frontend on Vercel** — users log in and get their own session in the browser.
+3. **Google OAuth** — external identity provider only (no custom passwords in v1).
+4. **Per-user database** — vocab tracker state persists across devices; batch sync on session end (not per-character).
+
+### High-level request paths
+
+**Vocab (always cloud):**
+```
+Browser → Vercel API (/api/vocab) → PostgreSQL
+```
+
+**AI compute (home PC when online):**
+```
+Browser → Vercel BFF (optional) → Home Compute Gateway → Transcription Server / Ollama
+```
+
+The BFF (Backend-for-Frontend) on Vercel is recommended: it holds the home gateway URL as a server secret, mints short-lived compute tokens for authenticated users, and avoids exposing the home endpoint or long-lived secrets to the browser.
+
+---
+
+## Recommended Additions & Modifications
+
+These go beyond the four stated requirements but address gaps that will surface in production.
+
+### 1. Unified Compute Gateway (instead of exposing `transcription_server.py` directly)
+
+Do **not** port-forward the raw transcription server to the internet. Wrap it in a **Compute Gateway** service that:
+
+- Validates **user JWTs** (or short-lived compute tokens issued by Vercel after Google login).
+- Applies **rate limiting**, **CORS**, and **request size limits** in one place.
+- Proxies to the existing transcription server (`/transcribe`, `/align`) and Ollama (`/api/generate`).
+- Exposes a single **`--remote`** / `LINGUACODA_REMOTE_MODE=1` entry point.
+
+The existing local Bearer token (`.transcription_server.token`) stays **loopback-only** between the gateway and the transcription server.
+
+### 2. Cloudflare Tunnel over raw port forwarding
+
+Prefer a **Cloudflare Tunnel** (`cloudflared`) to expose the home gateway:
+
+- No open inbound ports on the home router.
+- Built-in DDoS mitigation and optional WAF/rate rules at the edge.
+- Stable HTTPS hostname (e.g. `compute.yourdomain.com`) without dynamic DNS.
+
+If port forwarding is used instead, restrict source IPs where possible, terminate TLS at a reverse proxy (Caddy/nginx), and never bind AI services to `0.0.0.0` without the gateway in front.
+
+### 3. Next.js on Vercel (not a static SPA alone)
+
+Use **Next.js** so Vercel can host:
+
+- **Auth.js** Google OAuth callbacks (`/api/auth/*`).
+- **Server-side vocab API** routes with DB credentials never shipped to the client.
+- Optional **BFF proxy** to the home compute gateway.
+
+A plain static export cannot securely hold database credentials or perform OAuth token exchange.
+
+### 4. WebSocket or SSE for live transcription in the browser
+
+The desktop app streams transcription over Electron IPC. The browser needs **WebSocket** or **Server-Sent Events** from the compute gateway for the same live experience. REST-only polling is a poor fit for continuous audio sessions.
+
+### 5. Browser audio vs Electron audio
+
+| Capability | Web (Vercel) | Electron |
+|------------|--------------|----------|
+| Microphone capture | `getUserMedia` | Yes |
+| System/loopback audio | No (OS/browser restriction) | Yes (`electron_backend.py`) |
+| Vocab tracker | Yes (cloud sync) | Yes (cloud sync) |
+| Full subtitle pipeline | Yes (mic only) | Yes (mic + loopback) |
+
+Document this limitation in the web UI so users know the desktop app is required for system-audio capture.
+
+### 6. Vocab conflict resolution
+
+With multiple devices, two sessions may update the same word offline. Use **last-write-wins at the document level** for v1 (simplest), or **per-word max count merge** (recommended):
+
+```
+merged[word] = max(local[word], remote[word])
+```
+
+Store a `updated_at` timestamp on the vocab blob for debugging and future CRDT work.
+
+### 7. Debounced backup sync (in addition to close-batch)
+
+Batch-on-close alone is risky (tab crash, mobile browser kill). Also sync:
+
+- On `visibilitychange` → `hidden`
+- On `beforeunload` / `pagehide` via `navigator.sendBeacon`
+- Debounced every **5 minutes** during active use
+
+### 8. Offline / home-PC-down UX
+
+The vocab tracker and HSK dictionary can work offline (dictionary is static JSON). Transcription/translation should show a clear **“Compute server offline”** state with retry, since the home PC may sleep or lose power.
+
+### 9. Keep Electron as a first-class client
+
+Electron should adopt the same Google auth and cloud vocab sync, while retaining local loopback capture and optional direct loopback to the home gateway when running on the same machine.
+
+### 10. Do not persist LLM-derived caches in the database (v1)
+
+`pinyinCache` and `flashcardEntryCache` are regenerable. Only sync **`seenVocab`** (`{ word: count }`) to the database initially. This keeps payloads small and avoids stale LLM content across model versions.
+
+---
+
+## Component Responsibilities
+
+### Web Frontend (Vercel — Next.js)
+
+- Host the Language Learning Suite UI (ported from `renderer.js` / `index.html`).
+- Google sign-in via Auth.js; maintain HTTP-only session cookie.
+- Load HSK dictionary from static assets (same `hsk_dictionary.json`).
+- Vocab tracker: read from DB on login, mutate in memory during session, batch sync on close/interval.
+- Audio capture via Web Audio API / `MediaRecorder`; stream chunks to compute gateway.
+- Pinyin generation via `pinyin-pro` in the browser (already a dependency) — no Ollama needed for basic pinyin.
+
+### Cloud API (Vercel serverless routes)
+
+| Route | Purpose |
+|-------|---------|
+| `GET/POST /api/auth/*` | Auth.js Google OAuth |
+| `GET /api/vocab` | Fetch user's `seenVocab` blob |
+| `PUT /api/vocab` | Upsert vocab blob (batch) |
+| `POST /api/compute/token` | Issue short-lived JWT for home gateway (optional BFF) |
+| `GET /api/health/compute` | Ping home gateway; surface online/offline to UI |
+
+### Database (PostgreSQL)
+
+Recommended hosts: **Neon**, **Supabase**, or **Vercel Postgres**. Single region close to the user base.
+
+### Home Compute Gateway (new service on personal PC)
+
+| Flag | Behavior |
+|------|----------|
+| Default (local) | Binds `127.0.0.1`; Electron/desktop use only |
+| `--remote` / `LINGUACODA_REMOTE_MODE=1` | Binds behind tunnel; validates user tokens; enables CORS for Vercel origin |
+
+Responsibilities:
+
+- Authenticate requests (JWT from Auth.js or compute token from BFF).
+- Rate limit per user and per IP.
+- Queue concurrent ASR jobs (GPU-bound); return `429` when saturated.
+- Proxy `/transcribe`, `/align` to `transcription_server.py` (loopback + local token).
+- Proxy `/translate`, `/vocab-context`, `/flashcard-entry` to Ollama (same prompts as `main.js` today).
+- WebSocket endpoint for streaming transcription events.
+
+### Transcription Server (existing — `transcription_server.py`)
+
+Unchanged in responsibility. In remote mode it remains **localhost-only** (`127.0.0.1:8765`); only the gateway talks to it.
+
+### Electron Desktop (existing — evolution path)
+
+Current responsibilities preserved. Future: add Google login, cloud vocab sync, and configurable compute endpoint (local gateway vs remote tunnel URL).
+
+---
+
+## Authentication & Sessions
+
+```mermaid
+sequenceDiagram
+    participant U as User Browser
+    participant V as Vercel Next.js
+    participant G as Google OAuth
+    participant DB as PostgreSQL
+    participant H as Home Gateway
+
+    U->>V: Click Sign in with Google
+    V->>G: OAuth redirect
+    G->>V: Authorization code
+    V->>G: Exchange for tokens
+    V->>DB: Upsert user record
+    V->>U: Set HTTP-only session cookie
+
+    Note over U,H: AI compute session
+    U->>V: Request compute token
+    V->>U: Short-lived JWT 5-15 min
+    U->>H: API call with JWT
+    H->>H: Validate JWT signature
+    H->>U: Transcription / translation result
+```
+
+**Auth.js (NextAuth v5)** with Google provider:
+
+- **Session**: HTTP-only, Secure, SameSite=Lax cookie on the Vercel domain.
+- **User record**: `id`, `email`, `name`, `image`, `google_sub`, `created_at`.
+- **No passwords** in v1.
+
+**Compute tokens** (recommended):
+
+- Vercel signs a short-lived JWT after session validation.
+- Home gateway validates with a shared `JWT_SECRET` (or JWKS if using asymmetric keys).
+- Prevents anonymous internet access to expensive AI endpoints.
+
+---
+
+## Data Model & Vocab Sync
+
+### Schema (v1)
+
+```sql
+-- Managed by Auth.js adapter
+CREATE TABLE users (
+  id            TEXT PRIMARY KEY,
+  email         TEXT UNIQUE NOT NULL,
+  name          TEXT,
+  image         TEXT,
+  google_sub    TEXT UNIQUE,
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE user_vocab (
+  user_id     TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  seen_vocab  JSONB NOT NULL DEFAULT '{}',  -- { "你好": 3, "谢谢": 1 }
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+`seen_vocab` mirrors today's `localStorage.seenVocab` shape: `{ [word: string]: number }`.
+
+### Sync protocol
+
+1. **On login**: `GET /api/vocab` → hydrate in-memory `seenVocab`; merge with any local draft using per-word max count.
+2. **During session**: updates stay in memory (and optionally `localStorage` as a offline draft); `trackVocabFromText` behavior unchanged.
+3. **On sync trigger** (close, hidden, debounce, beacon): `PUT /api/vocab` with full blob or delta + `updated_at`.
+4. **Server merge**: `merged[w] = max(client[w], server[w])` per word; update `updated_at`.
+
+### What stays local-only
+
+| Data | Storage | Synced? |
+|------|---------|---------|
+| `seenVocab` | DB | Yes |
+| `pinyinCache` | localStorage | No (v1) |
+| `flashcardEntryCache` | localStorage | No (v1) |
+| Font size / zoom | localStorage | No |
+| Audio device selection | local (Electron) | No |
+
+---
+
+## Home Compute Gateway (Remote Backend)
+
+### Startup
+
+```bash
+# Local desktop development (default)
+python compute_gateway.py
+
+# Production remote mode (behind Cloudflare Tunnel)
+LINGUACODA_REMOTE_MODE=1 \
+JWT_SECRET=... \
+ALLOWED_ORIGINS=https://your-app.vercel.app \
+python compute_gateway.py --remote
+```
+
+### Suggested API surface
+
+| Method | Path | Auth | Proxies to |
+|--------|------|------|------------|
+| `GET` | `/health` | None | Gateway + downstream readiness |
+| `POST` | `/transcribe` | JWT | `transcription_server:8765/transcribe` |
+| `POST` | `/align` | JWT | `transcription_server:8765/align` |
+| `POST` | `/translate` | JWT | Ollama `/api/generate` |
+| `POST` | `/vocab-context` | JWT | Ollama (optional) |
+| `WS` | `/stream` | JWT | Audio session streaming |
+
+### Infrastructure on home PC
+
+```
+Internet → Cloudflare Tunnel → compute_gateway:8080
+                                    ↓ loopback
+                          transcription_server:8765
+                                    ↓ loopback
+                               Ollama:11434
+```
+
+Process supervision: **systemd** (Linux) or **NSSM** (Windows) to restart on failure. Health checks can ping `/health` from an external monitor (e.g. Uptime Kuma).
+
+---
+
+## Web Frontend (Vercel)
+
+### Repository layout (target)
+
+```
+linguacoda_ai/
+├── apps/
+│   └── web/                 # Next.js app (Vercel root)
+│       ├── app/
+│       ├── components/      # Ported UI from renderer.js
+│       └── lib/
+│           ├── auth.ts
+│           ├── vocab.ts
+│           └── compute-client.ts
+├── services/
+│   └── compute_gateway/     # Python — remote AI entry point
+├── transcription_server.py  # Unchanged ASR/align service
+├── electron/                # Existing Electron app (optional move)
+└── ARCHITECTURE.md
+```
+
+### Environment variables
+
+**Vercel:**
+- `AUTH_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
+- `DATABASE_URL`
+- `COMPUTE_GATEWAY_URL` (server-only)
+- `JWT_SECRET` (shared with home gateway for compute tokens)
+
+**Home PC:**
+- `LINGUACODA_REMOTE_MODE=1`
+- `JWT_SECRET` (same as Vercel)
+- `ALLOWED_ORIGINS`
+- `OLLAMA_ENDPOINT`, `OLLAMA_MODEL`
+- `MAX_CONCURRENT_TRANSCRIPTIONS` (e.g. 2–3)
+
+---
+
+## Security
+
+| Concern | Mitigation |
+|---------|------------|
+| Open AI endpoints | JWT on every compute request; no anonymous access in remote mode |
+| Local transcription token leaked | Keep `.transcription_server.token` on loopback only; gateway holds it |
+| DDoS / abuse | Cloudflare Tunnel + gateway rate limits + max body size on audio uploads |
+| CORS | Allow only the Vercel production (and preview) origins |
+| Session hijacking | HTTP-only Secure cookies; short compute token TTL |
+| Data isolation | All vocab queries scoped by `user_id` from session; no client-supplied user IDs |
+| Secrets in repo | `.env` / Vercel env / home PC env only; never commit |
+
+---
+
+## Concurrency & Rate Limiting
+
+The home PC has finite GPU/CPU. Recommended defaults:
+
+| Limit | Suggested value | Behavior |
+|-------|-----------------|----------|
+| Max concurrent `/transcribe` | 2–3 | Queue or `429 Too Many Requests` |
+| Max concurrent Ollama calls | 1–2 | Serialize translation to protect VRAM |
+| Rate limit per user | 60 req/min | Sliding window at gateway |
+| Rate limit per IP | 120 req/min | Edge or gateway |
+| Max audio payload | 5 MB per chunk | Reject oversize with `413` |
+
+Expose queue depth or estimated wait in `/health` so the UI can set expectations when multiple users are active.
+
+---
+
+## Desktop Client (Electron) — Current & Future
+
+### Current architecture (main branch)
+
 The project is an **Electron desktop app** with:
 
-- **Electron Main Process (Node.js)**: owns the app window, starts the Python backend, provides IPC handlers, and performs LLM calls for translation/analysis.
-- **Electron Renderer (HTML/CSS/JS)**: the UI, state management for pairs, scrolling/zoom behavior, and the semantic-unit detail view.
-- **Python Backend (`electron_backend.py`)**: captures audio from the selected device, buffers it, talks to an external transcription server, and streams transcription results to Electron via stdout.
-- **Transcription Server (`transcription_server.py` + `transcription_client.py`)**: a local HTTP service that performs **ASR via SenseVoice** (see `sensevoice_transcriber.py`), **cross-lingual word alignment via SimAlign** (`semantic_aligner.py`), and returns transcription or alignment results.
+- **Electron Main Process (`main.js`)**: window lifecycle, Python backend spawn, IPC handlers, Ollama translation calls.
+- **Electron Renderer (`renderer.js`)**: UI, transcription pairs, vocab tracker, flashcards.
+- **Python Backend (`electron_backend.py`)**: audio capture, buffering, transcription client.
+- **Transcription Server (`transcription_server.py`)**: SenseVoice ASR, SimAlign alignment.
 
-At runtime the flow looks like:
+At runtime:
 
 1. Electron starts and creates a window.
 2. Electron starts (or connects to) the transcription server.
 3. Electron starts the Python backend as a child process.
-4. Renderer requests devices/config over IPC and drives capture start/stop.
-5. Python backend captures audio and emits transcription events.
-6. Renderer appends transcription fragments; Electron main process translates each fragment via LLM; Renderer displays pairs and enables detail analysis.
+4. Renderer drives capture over IPC; backend emits transcription JSON on stdout.
+5. Main process translates via Ollama; renderer displays pairs and vocab tracking.
 
-## AI Components (Where the “AI” Lives)
+**IPC is the seam:** renderer → `preload.js` → `ipcMain` → Python backend / HTTP to transcription server / Ollama.
 
-This project has **three distinct AI subsystems**:
+### Future Electron integration
 
-1) **Speech-to-Text (ASR)** — runs in the **transcription server** (Python), implemented with **SenseVoice**.
-2) **Cross-lingual word alignment** — runs in the **transcription server** (Python), implemented with **pkuseg + SimAlign** (XLM-R embeddings, IterMax matching) for the semantic-unit detail view.
-3) **Text-to-Text LLM tasks** — run in the **Electron main process** (Node) by calling a local **Ollama** endpoint:
-   - Translation (transcription → English)
-   - Vocab context generation (optional learning features)
+- Add sign-in flow (embedded browser or deep link) sharing the same Auth.js app.
+- Replace direct Ollama IPC with compute gateway client when `COMPUTE_GATEWAY_URL` is set.
+- Vocab: load/sync via `/api/vocab` instead of only `localStorage`.
+- Keep loopback audio capture as the differentiator over the web client.
 
-### ASR: SenseVoice Transcription
+---
 
-- **Where**: `transcription_server.py` instantiates a `SenseVoiceTranscriber` (from `sensevoice_transcriber.py`).
-- **How**: the Python backend (`electron_backend.py`) sends buffered audio to the transcription server via `TranscriptionClient` (`transcription_client.py`).
-- **Model**: controlled in `config.py` via `SENSEVOICE_MODEL` (defaults to `iic/SenseVoiceSmall`).
-- **Outputs**:
-  - `transcription`: recognized text
-  - `detectedLang`: language ID when available (used by the UI for “Detected: …”)
+## AI Components
 
-### LLM: Translation via Ollama
+Three distinct AI subsystems (unchanged in technology choice):
 
-- **Where**: Electron main process (`main.js`) exposes an IPC handler `translate-text`.
-- **How**: `translate-text` calls Ollama’s `POST /api/generate` using `axios`.
-- **Prompt shape**: the translation prompt instructs: “Only provide the translation, no explanations”.
-- **Config**: `electron-config.json`
-  - `ollamaEndpoint` (default `http://127.0.0.1:11434`)
-  - `ollamaModel` (e.g. `gemma3:4b`)
+| Subsystem | Runtime (today) | Runtime (production) |
+|-----------|-----------------|----------------------|
+| **ASR (SenseVoice)** | `transcription_server.py` | Home PC transcription server |
+| **Alignment (SimAlign + pkuseg)** | `transcription_server.py` `/align` | Home PC transcription server |
+| **LLM (Ollama)** | Electron `main.js` | Home compute gateway → Ollama |
 
-### Semantic Unit Alignment (Detail View) via SimAlign
+### ASR: SenseVoice
 
-- **Where**: `semantic_aligner.py`, served by `transcription_server.py` at `POST /align`. Electron main process (`main.js`) IPC handler `extract-semantic-units` proxies to that endpoint.
-- **How** — deterministic pipeline (no LLM, no JSON parsing):
-  1. **Strip parentheticals** from both sides (ASCII `()` and full-width `（）`), so clarifiers like `(referring to X)` never become chunks.
-  2. **Tokenize** each side independently:
-     - **Chinese** (any Han characters): **pkuseg** word segmentation — multi-character words like `墨西哥城` stay one chunk.
-     - **English / Latin**: whitespace split with outer punctuation stripped; inner punctuation preserved (`8,000`, `don't`).
-  3. **Align** with **SimAlign** (`xlm-roberta-base`, IterMax matching) on the token lists. IterMax derives many-to-many links from XLM-R cosine similarity (e.g. `墨西哥城` → `["Mexico", "City"]`).
-  4. **Package** chunks + correlations for the renderer (`t1`… / `e1`… IDs, `matches` arrays per transcription chunk).
-- **Warmup**: aligner + pkuseg load in a background thread at server startup so the first detail-view open isn't blocked on model download.
-- **Auth**: same Bearer token as `/transcribe` (`.transcription_server.token`).
-- **Return shape** (from `/align`, wrapped by IPC as `{ success: true, … }`):
-  ```json
-  {
-    "transcriptionChunks": [{"id": "t1", "text": "…"}, …],
-    "translationChunks":  [{"id": "e1", "text": "…"}, …],
-    "correlations": [{"id": "t1", "matches": ["e1", "e2"]}, {"id": "t2", "matches": []}, …]
-  }
-  ```
-- **Renderer usage**:
-  - Renderer calls `window.electronAPI.extractSemanticUnits(transcription, translation)`
-  - Modal shows "Analyzing semantic units…" while waiting
-  - On success, chunks are matched back to character positions in the original text. **Only chunks that appear in some mapping** are rendered as interactive cards; **unmapped chunks render as plain text**.
-  - Hover highlighting uses the correlation map (bidirectional, with sibling links across multi-match groups).
+- Model: `SENSEVOICE_MODEL` in `config.py` (default `iic/SenseVoiceSmall`).
+- Client sends base64 float32 audio; receives `{ transcription, detectedLang }`.
 
-## Process & Module Responsibilities
+### LLM: Translation & learning features
 
-### Electron Main Process (`main.js`)
+- Ollama `POST /api/generate` with `ollamaModel` from config.
+- Used for: translation, vocab context, flashcard entries.
+- Prompts remain as implemented in `main.js` today; gateway rehosts them.
 
-**Responsibilities**
-- Creates the `BrowserWindow` and loads `index.html`.
-- Manages app lifecycle: start/stop processes.
-- Spawns the Python backend (`electron_backend.py`) and bridges stdout JSON events into renderer events.
-- Hosts IPC handlers for:
-  - Configuration retrieval
-  - Capture control (start/stop)
-  - Device enumeration / device selection persistence
-  - Translation (LLM call via Ollama)
-  - Semantic-unit alignment (HTTP proxy to transcription server `/align`)
+### Semantic alignment (detail view)
 
-**Key concept: “IPC is the seam”**
-- The renderer never calls Python directly.
-- The renderer never calls the LLM endpoint directly.
-- Instead, the renderer calls `window.electronAPI.*` methods (from `preload.js`), which map to `ipcMain.handle(...)` handlers in `main.js`.
+- `POST /align` with `{ transcription, translation }`.
+- Pipeline: strip parentheticals → pkuseg / whitespace tokenization → SimAlign (XLM-R, IterMax).
+- Returns `{ transcriptionChunks, translationChunks, correlations }`.
 
-### Preload Bridge (`preload.js`)
+---
 
-**Responsibilities**
-- Exposes a safe, explicit API (`window.electronAPI`) to the renderer via `contextBridge`.
-- Wraps IPC invocations (`ipcRenderer.invoke`) and event listeners (`ipcRenderer.on`) so the renderer can:
-  - Request config / devices
-  - Start/stop capture
-  - Translate text
-  - Extract semantic units (detail view)
-  - Receive events: transcription results, errors, audio device lists
+## Data Flows
 
-### Renderer / UI (`index.html`, `styles.css`, `renderer.js`)
+### Web: Audio → Transcription → Translation
 
-**Responsibilities**
-- UI layout and styling.
-- User interactions: device selection, start/stop capture, language selection, volume threshold, zoom, scrolling, and detail modal behavior.
-- Maintains the core UI state:
-  - `transcriptionPairs[]`: list of `{ transcription, translation }`
-  - capture state (`isCapturing`)
-  - language state (selected vs detected)
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant G as Home Gateway
+    participant T as Transcription Server
+    participant O as Ollama
 
-**View structure**
-- A top-level “suite” UI with a **menu screen** and a **subapp screen**:
-  - Menu shows “LinguaCoda Language Learning Suite” + navigation button.
-  - “Subtitles and Translation” transitions to the existing transcription/translation UI unchanged.
+    B->>B: getUserMedia mic capture
+    B->>G: WS connect + JWT
+    loop Audio chunks
+        B->>G: audio chunk
+        G->>T: POST /transcribe
+        T->>G: text + detectedLang
+        G->>B: transcription event
+        B->>G: POST /translate
+        G->>O: generate
+        O->>G: translation
+        G->>B: translation
+        B->>B: trackVocabFromText
+    end
+    B->>B: Vercel PUT /api/vocab on close
+```
 
-### Python Backend (`electron_backend.py`)
+### Desktop: Audio → Transcription (current)
 
-**Responsibilities**
-- Enumerates audio devices (often via `audio_capture.py`).
-- Captures audio from selected device (mic or loopback output), applying:
-  - volume threshold checks
-  - buffering + silence detection rules
-- Calls the transcription client (`TranscriptionClient`) which talks to the transcription server.
-- Emits messages to Electron via **stdout** as JSON, e.g.:
-  - `{ "type": "transcription", "data": { "transcription": "...", "detectedLang": "..." } }`
-  - `{ "type": "audio-devices", "data": ... }`
-  - `{ "type": "error", "data": ... }`
+1. Renderer → `startCapture` IPC → Python backend stdin.
+2. Backend buffers audio → `TranscriptionClient` → `POST /transcribe`.
+3. Backend stdout JSON → main process → renderer event.
+4. Renderer splits sentences → `translateText` IPC → Ollama.
+5. `trackVocabFromText` → `localStorage` (future: also cloud sync).
 
-**Important design detail**
-- The Python backend is intentionally “headless.” It does not render UI and does not call Ollama. Its AI-related responsibility is **feeding audio to the transcription server and forwarding ASR results upstream**.
+### Vocab sync (production)
 
-### Transcription Server (`transcription_server.py`)
+1. Login → fetch `user_vocab.seen_vocab`.
+2. Session mutations in memory.
+3. Triggers: `pagehide`, `visibilitychange(hidden)`, 5-min debounce → `PUT /api/vocab`.
 
-**Responsibilities**
-- HTTP API:
-  - `POST /transcribe` — audio payloads → transcription text + metadata.
-  - `POST /align` — `{ transcription, translation }` → semantic chunks + correlations (`semantic_aligner.py`).
-  - `GET /health` — includes `ready` (ASR) and `alignerReady` (pkuseg + SimAlign loaded).
-- Owns the **ASR model runtime** (SenseVoice via `sensevoice_transcriber.py`) and the **alignment runtime** (pkuseg + SimAlign / XLM-R).
-- Designed to be started by Electron (or already running), with health/readiness checks in the client.
-
-## Data Flow (End-to-End)
-
-### Audio → Transcription
-
-1. Renderer calls `window.electronAPI.startCapture(deviceId, deviceType)`.
-2. Main process forwards to the Python backend via stdin (JSON command).
-3. Python backend starts capturing and buffering audio.
-4. On buffer completion, backend calls transcription server.
-5. Backend prints JSON transcription messages to stdout.
-6. Main process reads stdout, parses JSON, and forwards to renderer via `webContents.send('transcription-result', data)`.
-7. Renderer receives the transcription event and processes it.
-
-### Transcription → Sentence Fragments → Translation Pairs
-
-Renderer performs **sentence splitting** so each “sentence-like fragment” becomes its own pair:
-
-- Incoming transcription text is split by sentence-ending punctuation (e.g., `.`, `..`, `...`, `。`, `．`).
-- Each fragment becomes:
-  - `transcriptionPairs.push({ transcription: fragment, translation: '' })`
-  - then an async translation request is triggered for that fragment.
-
-Translation is performed in the main process (LLM call) via:
-- `window.electronAPI.translateText(fragment)` → `ipcMain.handle('translate-text', ...)` → LLM endpoint.
-
-Semantic unit alignment (for the detail modal):
-- `window.electronAPI.extractSemanticUnits(transcription, translation)` → `ipcMain.handle('extract-semantic-units', ...)` → `POST http://127.0.0.1:8765/align` (SimAlign).
-
-### Display: Aligned Pair Rendering
-
-The UI renders transcription pairs as two synchronized columns:
-
-- Left: transcription
-- Right: translation
-
-Pairs are rendered as aligned “blocks,” and heights are normalized to keep the left/right row outlines aligned.
-
-## UX/Behavior Features
-
-### Menu Navigation
-
-The app starts in a menu screen and transitions to the “Subtitles and Translation” subapp without altering that subapp’s internal layout.
-
-### Capture-Time Scrolling Rules
-
-The renderer distinguishes two states:
-
-- **When capturing (`isCapturing === true`)**
-  - Always autoscroll to the bottom as new content arrives.
-  - User scrolling is blocked (wheel scrolling prevented), but **Ctrl+scroll zoom** remains enabled.
-
-- **When not capturing**
-  - No forced autoscroll.
-  - User can scroll freely as normal.
-
-This ensures live capture stays “followed” like a log, while still allowing review when stopped.
-
-### Zoom
-
-Zoom is implemented as a font-size adjustment driven by Ctrl+mousewheel on the content area.
-
-### Detail View (Semantic Unit Mapping)
-
-Clicking either side of a pair opens a modal detail view that maps semantic units between the two sentences.
-
-**When it runs**
-- The detail view requires both transcription and translation to exist for the selected pair.
-
-**How it works**
-1. Renderer opens modal and shows a loading state.
-2. Renderer calls `window.electronAPI.extractSemanticUnits(transcription, translation)`.
-3. Main process forwards the pair to the transcription server's `/align` endpoint (`semantic_aligner.py`):
-   - strips parenthetical clarifiers/tags
-   - tokenizes Chinese with **pkuseg**, English with whitespace + punctuation rules
-   - runs **SimAlign** (XLM-R + IterMax) for many-to-many word alignment
-4. Renderer receives `{ transcriptionChunks, translationChunks, correlations }` and:
-   - matches each chunk back to its character position in the original sentence text
-   - renders mapped chunks as "rounded corners cards" and unmapped chunks as plain text
-   - builds a bidirectional correlation map (with sibling links across multi-match groups) so hovering any card highlights every linked card on both sides
-
-**Rendering strategy**
-- `matchChunksToText` walks through the chunk list in order, searching forward in the original text to find each chunk's position (handles repeated words by advancing a cursor).
-- `collectMappedChunkIds` scans the correlations and returns the set of all chunk IDs (`t*` and `e*`) that participate in at least one non-empty mapping.
-- `renderChunksAsCards` renders each segment as either an interactive card (if its chunk ID is in the mapped set) or a plain text node (if it isn't). Gaps between segments are always plain text.
-- `setupCorrelationHighlighting` builds a `chunkId → Set<chunkId>` map from the correlations array — bidirectional between transcription and translation, and across siblings within a multi-match group — and highlights linked cards on hover.
+---
 
 ## Configuration & Persistence
 
-- App-level settings live in `config.py` (Python) and `electron-config.json` (Electron).
-- Audio device selections are cached in `device_cache.json` and managed by `device_cache.py`.
-- The renderer stores some UX preferences (e.g., font size) in `localStorage`.
+| Setting | Desktop (today) | Web (target) | Remote gateway |
+|---------|-------------------|--------------|----------------|
+| Ollama endpoint | `electron-config.json` | N/A (server-side) | env `OLLAMA_ENDPOINT` |
+| Transcription URL | `127.0.0.1:8765` | via gateway URL | loopback |
+| Vocab | `localStorage.seenVocab` | PostgreSQL | N/A |
+| Auth | N/A | Auth.js + Google | JWT validation |
+| Device cache | `device_cache.json` | N/A | N/A |
+
+---
+
+## Migration Phases
+
+### Phase 1 — Auth + vocab cloud (no remote compute)
+
+- Next.js on Vercel with Google login.
+- PostgreSQL `user_vocab` table.
+- Port vocab tracker UI; batch sync on close.
+- Transcription/translation disabled or mocked in web UI.
+
+### Phase 2 — Compute gateway + tunnel
+
+- Implement `compute_gateway.py` with `--remote` flag.
+- Cloudflare Tunnel to home PC.
+- BFF compute token route on Vercel.
+- Web client: mic capture + live transcription.
+
+### Phase 3 — Electron parity
+
+- Electron uses same auth and vocab API.
+- Optional: Electron talks to local gateway when on same machine.
+- Loopback capture remains Electron-only.
+
+### Phase 4 — Hardening
+
+- Rate limits, monitoring, structured logging.
+- Preview deployment auth restrictions.
+- Load testing for concurrent sessions.
+
+---
 
 ## Error Handling & Resilience
 
-- Python backend emits `error` messages to Electron when capture/transcription fails.
-- Main process forwards errors to renderer so UI can display status updates.
-- Transcription server readiness is checked; startup includes retries/waits.
-- LLM calls (translation, vocab context) and alignment (`/align`) handle network errors, timeouts, and missing/invalid responses.
-- First `/align` after a cold start may take longer while XLM-R loads (~1 GB); the server warms up the aligner in a background thread at startup.
+| Failure | Response |
+|---------|----------|
+| Home gateway offline | UI banner; vocab still works; queue failed compute retries |
+| Transcription server cold start | `/health` shows `ready: false`; UI loading state (existing behavior) |
+| Aligner not warmed up | `/health.alignerReady`; detail view shows loading (existing behavior) |
+| Ollama timeout | Per-request timeout; show pair with transcription only |
+| Vocab sync conflict | Per-word max merge; log `updated_at` mismatch |
+| Tab killed before sync | `sendBeacon` on `pagehide`; localStorage draft as fallback |
+| Rate limit hit | `429` with `Retry-After`; UI backoff message |
+
+---
 
 ## Extensibility Notes
 
-Suggested extension points:
+- **New suite tools**: add routes/views in Next.js app; shared components from renderer port.
+- **New analyses per pair**: add gateway endpoint + client method.
+- **Cache semantic units**: store on `transcriptionPairs[i]` client-side to avoid repeat `/align`.
+- **Multi-user home server**: per-user JWT identity enables fair queuing and audit logs.
+- **Future paid tier**: gate compute token issuance by subscription in Vercel BFF.
 
-- **Add new “suite” tools**: add a new menu button + a new view container in `index.html`, and route via renderer navigation helpers.
-- **Add new analyses for a pair**: add new IPC handlers in `main.js`, expose in `preload.js`, and add UI components in renderer.
-- **Improve sentence splitting**: extend the sentence-end regex to include `?`, `!`, `！？`, `…` (unicode ellipsis), etc.
-- **Cache semantic unit results**: store extracted units on `transcriptionPairs[pairIndex]` to avoid repeated `/align` calls.
-- **Tune alignment**: adjust SimAlign matching method or add a cosine-similarity threshold in `semantic_aligner.py` if spurious links appear.
+---
 
+## Summary
+
+The production system is a **three-tier architecture**: Vercel hosts the authenticated web experience and vocab persistence; a **home compute gateway** (remote mode) exposes AI capabilities behind JWT auth, rate limits, and preferably a Cloudflare Tunnel; the existing **transcription server** and **Ollama** stay on the home PC as internal services. Google OAuth provides identity; PostgreSQL stores per-user `seenVocab` with batch sync and multi-device merge. The Electron app remains the power-user client for loopback audio while sharing the same account and vocab data.
