@@ -6,6 +6,18 @@ A desktop application that helps you learn foreign languages by:
 3. Translating the transcription to English using Ollama
 4. Displaying both original transcription and translation in real-time
 
+## Repository layout
+
+| Path | Purpose |
+|------|---------|
+| **Repo root** (`main.js`, `renderer.js`, `electron_backend.py`, …) | **Electron desktop app** (primary client) + Python AI services |
+| `services/cloud-api/` | Vercel-deployed cloud API (Google auth, vocab sync, compute tokens) — API routes only, not the product UI |
+| `services/compute_gateway/` | Home PC AI gateway for shared transcription/LLM workloads (Phase 2) |
+
+Run the desktop app from the repo root (`npm start`). Run the cloud API locally with `npm run dev:api` or `cd services/cloud-api && npm run dev`.
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full production design and [MIGRATION_PROMPTS.md](./MIGRATION_PROMPTS.md) for the implementation plan.
+
 ## Features
 
 - Real-time audio capture from system output
