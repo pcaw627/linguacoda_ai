@@ -1,6 +1,8 @@
 # LinguaCoda — Migration Prompts
 
-Copy-paste prompts for implementing the production migration described in [ARCHITECTURE.md](./ARCHITECTURE.md). Run them **in order** within each phase; do not skip ahead until the verification criteria pass.
+Copy-paste prompts for implementing the **Electron-first** production migration described in [ARCHITECTURE.md](./ARCHITECTURE.md). Run them **in order** within each phase; do not skip ahead until the verification criteria pass.
+
+> **Architecture note:** The Electron desktop app is the **only end-user client**. Vercel hosts a **slim cloud API** (auth, vocab, compute tokens) — not the subtitles/vocab UI. WASAPI loopback capture stays in Electron. Do **not** port `renderer.js` to a browser app.
 
 ## How to use these prompts
 
@@ -8,52 +10,54 @@ Copy-paste prompts for implementing the production migration described in [ARCHI
 2. **Run one prompt at a time** in Cursor Agent mode (or equivalent).
 3. **Verify** the checkpoint at the end of each prompt before moving on.
 4. **Provide context** when a prompt says "assume X is done" — paste the previous prompt's outcome or file paths if the agent lacks session memory.
-5. **Do not break Electron** unless the prompt explicitly says to modify it. The desktop app must keep working until Phase 3.
+5. **Preserve local mode:** `computeMode: local` must keep today's behavior until remote mode is explicitly enabled.
 
 ### Conventions
 
-- Web app root: `apps/web/`
-- Existing Electron app: repo root (`main.js`, `renderer.js`, etc.)
-- Python AI services: repo root (`transcription_server.py`, etc.)
-- New gateway: `services/compute_gateway/`
+| Path | Purpose |
+|------|---------|
+| Repo root (`main.js`, `renderer.js`, …) | Electron desktop app — primary client |
+| `services/cloud-api/` | Minimal Next.js API deployed to Vercel |
+| `services/compute_gateway/` | Python AI gateway on home PC |
+| `transcription_server.py`, `electron_backend.py` | Existing — extend, don't replace |
 
 ### Environment variables reference
 
 | Variable | Where | Phase |
 |----------|-------|-------|
-| `DATABASE_URL` | Vercel + `apps/web/.env.local` | 1 |
+| `DATABASE_URL` | Vercel + `services/cloud-api/.env.local` | 1 |
 | `AUTH_SECRET` | Vercel + local | 1 |
 | `GOOGLE_CLIENT_ID` | Vercel + local | 1 |
 | `GOOGLE_CLIENT_SECRET` | Vercel + local | 1 |
 | `AUTH_URL` | Vercel production | 1 |
-| `JWT_SECRET` | Vercel + home PC | 2 |
-| `COMPUTE_GATEWAY_URL` | Vercel (server-only) | 2 |
-| `ALLOWED_ORIGINS` | Home PC gateway | 2 |
+| `JWT_SECRET` | Vercel + home PC gateway | 2 |
+| `COMPUTE_GATEWAY_URL` | Vercel (server-only, optional health ping) | 2 |
 | `LINGUACODA_REMOTE_MODE` | Home PC gateway | 2 |
+| `cloudApiBaseUrl` | `electron-config.json` | 1 |
+| `computeMode` | `electron-config.json` (`local` \| `remote`) | 2 |
+| `computeGatewayUrl` | `electron-config.json` | 2 |
 
 ---
 
 ## Phase 0 — Repo prep
 
-### Prompt 0.1 — Scaffold Next.js web app
+### Prompt 0.1 — Scaffold slim cloud API
 
 ```
-Scaffold a Next.js App Router app at apps/web/ in this repo without breaking the existing Electron app at the repo root.
+Scaffold a minimal Next.js App Router API app at services/cloud-api/ for Vercel deployment. This is NOT a web UI — API routes and OAuth callbacks only.
 
 Requirements:
-- Use TypeScript, Tailwind CSS, ESLint, src/ directory, import alias @/*
+- Use TypeScript, ESLint, src/ directory, import alias @/*
 - Do NOT move or delete existing Electron files (main.js, renderer.js, preload.js, index.html, etc.)
-- Add apps/web/package.json with its own scripts (dev, build, start, lint)
-- Update root .gitignore to cover apps/web/node_modules, .next, .env.local
-- Copy hsk_dictionary.json to apps/web/public/hsk_dictionary.json
-- Copy assets/images/ to apps/web/public/assets/images/
+- services/cloud-api/package.json with scripts: dev, build, start, lint
+- Minimal src/app/page.tsx: static page with app name + "Desktop app required" message and optional download link placeholder — no vocab grid, no subtitles UI
+- Update root .gitignore for services/cloud-api/node_modules, .next, .env.local
+- services/cloud-api/README.md: explains this is the Vercel-deployed cloud API (auth + vocab + tokens), not the product UI
 
-Deliverables:
-- apps/web/ fully scaffolded
-- Brief note in apps/web/README.md explaining this is the Vercel-deployed web client
+Do not copy renderer.js, styles.css, or hsk_dictionary.json to the cloud API (Electron keeps those).
 
 Verification:
-- cd apps/web && npm run dev serves localhost:3000
+- cd services/cloud-api && npm run dev serves localhost:3000
 - npm start at repo root still launches Electron unchanged
 ```
 
@@ -63,571 +67,572 @@ Verification:
 Add minimal monorepo documentation without restructuring the Electron app.
 
 Requirements:
-- Add a short "Repository layout" section to the root README.md (or create one if missing) describing:
-  - apps/web = Vercel web client (Next.js)
-  - repo root = Electron desktop + Python AI services
-- Add a root package.json script "dev:web": "npm run dev --prefix apps/web" if a root package.json exists; otherwise document the cd apps/web && npm run dev command
-- Ensure .gitignore covers: apps/web/.env.local, apps/web/.next, node_modules in both roots
+- Add a "Repository layout" section to the root README.md (or create one if missing):
+  - Repo root = Electron desktop app (primary client) + Python AI services
+  - services/cloud-api = Vercel cloud API (auth, vocab, compute tokens)
+  - services/compute_gateway = home PC AI gateway (Phase 2)
+- Add root package.json script "dev:api": "npm run dev --prefix services/cloud-api" if root package.json exists
+- Ensure .gitignore covers services/cloud-api/.env.local, .next
 
-Do not change Electron behavior. Keep the diff small.
+Do not change Electron behavior.
 
 Verification:
 - git status shows no accidental deletion of Electron files
-- dev:web or documented equivalent works
+- dev:api or documented equivalent works
 ```
 
 ---
 
-## Phase 1 — Auth + vocab cloud
+## Phase 1 — Cloud API + Electron auth & vocab sync
 
 ### Prompt 1.1 — Prisma + PostgreSQL schema
 
 ```
-Set up Prisma with PostgreSQL in apps/web/ for Auth.js and user vocab storage.
+Set up Prisma with PostgreSQL in services/cloud-api/ for Auth.js and user vocab storage.
 
 Requirements:
 - Install prisma and @prisma/client
-- Create prisma/schema.prisma with:
-  - Auth.js adapter models: User, Account, Session, VerificationToken (standard Auth.js Prisma schema)
-  - UserVocab model: userId (PK, FK to User), seenVocab (Json, default {}), updatedAt (DateTime @updatedAt)
-- Create src/lib/prisma.ts singleton client (handle Next.js hot reload)
-- Add .env.example in apps/web listing DATABASE_URL and AUTH_SECRET
-- Document in apps/web/README.md: run `npx prisma migrate dev --name init` after setting DATABASE_URL
+- prisma/schema.prisma with:
+  - Auth.js adapter models: User, Account, Session, VerificationToken
+  - UserVocab: userId (PK, FK to User), seenVocab (Json, default {}), updatedAt (DateTime @updatedAt)
+- src/lib/prisma.ts singleton (Next.js hot-reload safe)
+- services/cloud-api/.env.example: DATABASE_URL, AUTH_SECRET
+- README: run npx prisma migrate dev --name init after setting DATABASE_URL
 
-Follow existing project conventions. Do not add auth UI yet.
+No Electron changes in this prompt.
 
 Verification:
 - prisma validate passes
-- schema includes UserVocab with seenVocab Json field matching { [word: string]: number }
+- seenVocab shape matches renderer.js localStorage.seenVocab: { [word: string]: number }
 ```
 
 ### Prompt 1.2 — Auth.js with Google provider
 
 ```
-Implement Auth.js (NextAuth v5) with Google OAuth in apps/web/.
+Implement Auth.js (NextAuth v5) with Google OAuth in services/cloud-api/.
 
 Requirements:
-- Install next-auth@beta and @auth/prisma-adapter
-- Create src/auth.ts with Google provider and PrismaAdapter
-- Create src/app/api/auth/[...nextauth]/route.ts exporting GET and POST handlers
-- Use database sessions (strategy: "database") with the Prisma adapter
-- Create a minimal src/app/page.tsx:
-  - If signed in: show user email and a Sign out button (server action)
-  - If signed out: show Sign in with Google button (server action)
-- Add src/middleware.ts only if needed for auth route protection (keep minimal for now)
-- Update apps/web/.env.example with GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, AUTH_SECRET, AUTH_URL
+- next-auth@beta, @auth/prisma-adapter
+- src/auth.ts: Google provider + PrismaAdapter, database sessions
+- src/app/api/auth/[...nextauth]/route.ts
+- Minimal src/app/page.tsx: Sign in / Sign out for manual OAuth testing in browser (dev only)
+- .env.example: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, AUTH_SECRET, AUTH_URL
 
-Reference ARCHITECTURE.md Authentication section. Do not implement vocab API yet.
+Reference ARCHITECTURE.md Authentication section. No vocab API yet.
 
 Verification:
-- npm run build succeeds in apps/web
-- /api/auth/signin and /api/auth/callback/google routes exist
+- npm run build succeeds in services/cloud-api
+- /api/auth/signin and /api/auth/callback/google exist
 ```
 
 ### Prompt 1.3 — Vocab API routes
 
 ```
-Implement authenticated vocab read/write API routes in apps/web/.
+Implement authenticated vocab API routes in services/cloud-api/.
 
 Requirements:
-- GET /api/vocab (src/app/api/vocab/route.ts):
-  - Require auth via auth() from src/auth.ts
-  - Return 401 if no session
-  - Fetch UserVocab for session.user.id; create empty row if missing
-  - Response: { seenVocab: Record<string, number>, updatedAt: string (ISO) }
+- GET /api/vocab:
+  - auth() required; 401 if no session
+  - Fetch or create UserVocab for session.user.id
+  - Response: { seenVocab: Record<string, number>, updatedAt: string }
 - PUT /api/vocab:
-  - Require auth
+  - auth() required
   - Body: { seenVocab: Record<string, number> }
-  - Merge with per-word max: merged[word] = max(existing[word] ?? 0, incoming[word] ?? 0)
-  - Upsert UserVocab, update updatedAt
-  - Response: { seenVocab, updatedAt }
-- Add src/lib/vocab.ts with mergeSeenVocab(existing, incoming) helper and types
-- Handle malformed JSON with 400
+  - Per-word max merge: merged[w] = max(existing[w] ?? 0, incoming[w] ?? 0)
+  - Upsert, return { seenVocab, updatedAt }
+- src/lib/vocab.ts: mergeSeenVocab() helper + types
+- Malformed body → 400; payload > 500KB → 413
 
-Do not build UI yet. Match data shape of localStorage.seenVocab in renderer.js.
+Match localStorage.seenVocab shape from renderer.js. No Electron changes yet.
 
 Verification:
 - TypeScript compiles
-- mergeSeenVocab unit logic: max merge works for conflicting counts
+- mergeSeenVocab handles conflicting counts correctly
 ```
 
-### Prompt 1.4 — Vocab sync client library
+### Prompt 1.4 — API token route for Electron (session handoff)
 
 ```
-Create a client-side vocab sync module for apps/web/ that will back the vocab tracker UI.
+Add an API authentication mechanism Electron can use to call /api/vocab without browser cookies.
 
 Requirements:
-- src/lib/vocab-client.ts (or src/hooks/useVocab.ts) with:
-  - In-memory seenVocab state
-  - loadVocab(): GET /api/vocab when authenticated
-  - saveVocab(): PUT /api/vocab with current state
-  - trackWord(word) / trackVocabFromText(text, hskWords) — port greedy longest-match logic from renderer.js trackVocabFromText
-  - mergeOnLogin(remote, localDraft): per-word max merge
-  - Sync triggers:
-    - debounced save every 5 minutes during activity
-    - save on visibilitychange → hidden
-    - save on pagehide via fetch with keepalive: true (and sendBeacon fallback if needed)
-  - localStorage key linguacoda_seenVocab_draft as offline draft; clear after successful cloud sync
-- Export types and a React hook useVocab() if using hooks
+- POST /api/auth/desktop-token (or /api/auth/electron-token):
+  - Accepts a one-time code or exchange token from the desktop OAuth callback flow (design for Prompt 1.6)
+  - Returns a long-lived API token (or refresh token) Electron stores in safeStorage
+- GET /api/vocab and PUT /api/vocab: accept Authorization: Bearer <api-token> in addition to Auth.js session cookie
+- src/lib/api-auth.ts: validateApiToken(), link token to userId
+- Prisma model ApiToken: id, userId, tokenHash, expiresAt, createdAt (store hash only, not plaintext)
+- .env.example updated
 
-Do not port full UI yet. No transcription features.
+Alternatively use JWT session tokens with refresh — pick one approach and document it in README.
 
 Verification:
-- Hook/module compiles
-- trackVocabFromText logic matches renderer.js behavior for HSK word segmentation
+- Vocab routes work with Bearer token (curl test)
+- Invalid token returns 401
 ```
 
-### Prompt 1.5 — Port vocab tracker UI
+### Prompt 1.5 — Vercel deployment config
 
 ```
-Port the HSK Vocab Tracker UI from the Electron app to apps/web/ as an authenticated page.
+Prepare services/cloud-api/ for Vercel deployment.
 
 Requirements:
-- New route: src/app/vocab/page.tsx (or /suite with vocab section) — require login, redirect to / if not authenticated
-- Port styles from styles.css for vocab tracker (convert to Tailwind or CSS module; preserve GitHub-style grid, level sections, search)
-- Load HSK dictionary from /hsk_dictionary.json (same format as electronAPI.getHskDictionary)
-- Use pinyin-pro for pinyin display and search (install in apps/web)
-- Wire useVocab() hook: load on mount, track counts, sync on triggers from Prompt 1.4
-- Port vocab search: normalizePinyin, vocabMatchesSearch from renderer.js
-- Show stats: "X / Y words seen" and search match counts
-- Menu/landing: update home page to link to Vocab Tracker when signed in
-
-Do NOT port transcription, translation, flashcards, or detail modal yet.
-Show a "Subtitles & Translation — coming soon" placeholder nav item.
-
-Reference: renderer.js initializeVocabTracker, renderVocabGrid, setupVocabSearch, and related CSS in styles.css.
+- Document in services/cloud-api/README.md:
+  - Vercel root directory = services/cloud-api
+  - Env vars: DATABASE_URL, AUTH_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, AUTH_URL
+  - Google OAuth redirect: https://<domain>/api/auth/callback/google
+  - prisma generate in build: "build": "prisma generate && next build"
+  - prisma migrate deploy for production
+- .env.local gitignored; no secrets committed
 
 Verification:
-- Signed-in user sees vocab grid grouped by HSK level 1-6
-- Search by pinyin and hanzi works
-- seenVocab persists across page refresh
+- npm run build succeeds with DATABASE_URL set
+- README has complete Vercel checklist
 ```
 
-### Prompt 1.6 — Vercel deployment config
+### Prompt 1.6 — Electron Google auth flow
 
 ```
-Prepare apps/web/ for Vercel deployment.
+Implement Sign in with Google in the Electron app, using the cloud API for OAuth.
 
 Requirements:
-- apps/web/vercel.json only if needed (usually not for standard Next.js)
-- Document deployment steps in apps/web/README.md:
-  - Vercel root directory = apps/web
-  - Required env vars: DATABASE_URL, AUTH_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, AUTH_URL
-  - Google OAuth redirect URI: https://<vercel-domain>/api/auth/callback/google
-  - Run prisma migrate deploy in Vercel build or document manual migration for production
-- Add postinstall or build script to run prisma generate (prisma generate in package.json build pipeline)
-- For production DB migrations: add "build": "prisma generate && next build" pattern
+- electron-config.json: cloudApiBaseUrl (e.g. https://your-api.vercel.app)
+- main.js:
+  - Register linguacoda:// protocol handler
+  - IPC: sign-in, sign-out, get-auth-status
+  - sign-in opens system browser to cloudApiBaseUrl + /api/auth/signin?callbackUrl=...
+  - Cloud API callback page /auth/desktop-callback redirects to linguacoda://auth/callback?code=...
+  - Exchange code for API token via POST /api/auth/desktop-token; store in safeStorage
+- preload.js + electronAPI: signIn(), signOut(), getAuthStatus()
+- renderer.js: minimal account UI in menu or settings — show email when signed in, Sign in / Sign out buttons
+- Cloud API: implement /auth/desktop-callback page and token exchange from Prompt 1.4
 
-Do not commit secrets. Ensure .env.local is gitignored.
+Prefer system browser over embedded WebView. Document manual test steps.
 
 Verification:
-- npm run build succeeds locally with DATABASE_URL set
-- README has complete Vercel setup checklist
+- User can sign in via Google from Electron
+- safeStorage holds token; restart app still signed in
+- Sign out clears token
 ```
 
-### Prompt 1.7 — Phase 1 integration test page
+### Prompt 1.7 — Electron cloud vocab sync
 
 ```
-Add a minimal integration test / dev utilities page for Phase 1 verification.
+Add cloud vocab sync to the existing Electron renderer. Keep localStorage as offline draft. Do NOT port UI to web.
 
 Requirements:
-- src/app/dev/sync-test/page.tsx (or /api/health) — auth-protected in production via env check or simple NODE_ENV guard
-- Display: last sync time, seenVocab entry count, updatedAt from server
-- Buttons: Force sync now, Reset local draft, Show raw JSON
-- GET /api/health returns { ok: true, db: "connected" } with a simple prisma query
+- New module: vocab-sync.js (or section in renderer.js) + main.js IPC helpers for authenticated HTTP:
+  - cloudApiFetch(path, options) in main process — attaches Bearer token from safeStorage
+- electron-config.json: cloudApiBaseUrl (already from 1.6)
+- On login / app start (if authenticated):
+  - GET cloudApiBaseUrl/api/vocab
+  - mergeOnLogin(remote, localStorage draft) — per-word max
+  - hydrate seenVocab in renderer
+- trackVocabFromText: update memory + localStorage draft; remove blind overwrite of cloud-only state
+- Sync triggers:
+  - app before-quit / window-close IPC → PUT /api/vocab
+  - debounced save every 5 minutes
+  - optional "Sync now" not required yet
+- When not authenticated or cloudApiBaseUrl unset: behavior identical to today (localStorage only)
 
-This helps verify multi-device sync during development. Hide or 404 in production if NEXT_PUBLIC_ENABLE_DEV_PAGES is not set.
+Do not change transcription, translation, or capture logic.
 
 Verification:
-- Health endpoint works
-- Dev page shows vocab state after tracking words
+- Signed-in user: vocab survives app restart
+- Two Electron installs with same Google account converge on per-word max counts
+- Unsigned / no cloudApiBaseUrl: works offline as before
+```
+
+### Prompt 1.8 — Phase 1 health endpoint
+
+```
+Add GET /api/health to services/cloud-api/ and a dev sync status indicator in Electron.
+
+Requirements:
+- GET /api/health → { ok: true, db: "connected" } with simple prisma query
+- Electron settings/account area: show last vocab sync time, cloud API reachability (optional IPC ping /api/health)
+- Hide dev details from casual users — small status text is enough
+
+Verification:
+- /api/health returns 200 when DB connected
+- Electron shows signed-in email + last sync timestamp after vocab save
 ```
 
 ---
 
-## Phase 2 — Compute gateway + remote AI
+## Phase 2 — Compute gateway + Electron remote mode
 
 ### Prompt 2.1 — Compute gateway (local mode)
 
 ```
-Implement a Python Compute Gateway at services/compute_gateway/ that unifies access to the existing transcription server and Ollama.
+Implement Python Compute Gateway at services/compute_gateway/ unifying transcription server and Ollama access.
 
 Requirements:
-- Entry point: services/compute_gateway/main.py (or compute_gateway.py at repo root if you prefer)
-- Local mode (default): bind 127.0.0.1:8080, no JWT required
+- Entry: services/compute_gateway/main.py
+- Local mode (default): bind 127.0.0.1:8080, no JWT
 - Endpoints:
-  - GET /health — aggregate status from transcription_server GET /health and Ollama GET /api/tags (or equivalent)
-  - POST /transcribe — proxy to http://127.0.0.1:8765/transcribe with Bearer token read from .transcription_server.token
-  - POST /align — proxy to /align with same auth
-  - POST /translate — call Ollama POST /api/generate using the same prompt and config as main.js translate-text handler (read electron-config.json for ollamaEndpoint and ollamaModel)
-- Read transcription token from repo-root .transcription_server.token
-- Use stdlib http.server or FastAPI/Flask — match project style (transcription_server uses stdlib; FastAPI is fine if you add requirements)
-- Add services/compute_gateway/requirements.txt if new deps needed
+  - GET /health — transcription_server /health + Ollama status
+  - POST /transcribe — proxy to 127.0.0.1:8765/transcribe with .transcription_server.token Bearer
+  - POST /align — proxy to /align
+  - POST /translate — Ollama /api/generate, same prompt as main.js translate-text (electron-config.json)
+  - POST /vocab-context, POST /flashcard-entry — Ollama, same prompts as main.js handlers
+- services/compute_gateway/requirements.txt if needed
 - CLI: python -m services.compute_gateway.main [--port 8080]
 
-Do NOT implement --remote, JWT, or CORS yet. Transcription server stays on 127.0.0.1 only.
+No --remote yet. Transcription server stays loopback-only.
 
 Verification:
-- With transcription_server.py and Ollama running, curl localhost:8080/health returns ok
-- POST /transcribe with sample audio payload matches direct server behavior
-- POST /translate returns translation for a Chinese test string
+- curl localhost:8080/health ok with transcription_server + Ollama running
+- POST /translate returns translation for test Chinese string
 ```
 
-### Prompt 2.2 — Gateway remote mode + JWT + CORS
+### Prompt 2.2 — Gateway remote mode + JWT + rate limiting
 
 ```
-Add --remote mode to the Compute Gateway with JWT validation, CORS, and basic rate limiting.
+Add --remote mode to Compute Gateway with JWT validation and rate limiting.
 
 Requirements:
-- --remote flag or LINGUACODA_REMOTE_MODE=1 env:
-  - Require Authorization: Bearer <JWT> on all endpoints except GET /health (health may be public or optionally protected — document choice)
-  - Validate JWT with JWT_SECRET env (HS256), check exp claim
-  - CORS: allow origins from ALLOWED_ORIGINS env (comma-separated), e.g. https://your-app.vercel.app
-  - Rate limit: simple in-memory sliding window per JWT sub — 60 requests/minute (return 429 with Retry-After)
-  - Max request body size: 5 MB for transcribe (return 413)
-- Local mode (no --remote): unchanged, no JWT
-- Document env vars in services/compute_gateway/README.md
+- --remote or LINGUACODA_REMOTE_MODE=1:
+  - Authorization: Bearer <JWT> required on all endpoints except GET /health (document if health is public)
+  - Validate JWT_SECRET (HS256), check exp
+  - Rate limit per JWT sub: 60 req/min → 429 + Retry-After
+  - Max body 5 MB on /transcribe → 413
+- Local mode unchanged
+- services/compute_gateway/README.md documents env vars
+- CORS optional (Electron main process is not a browser CORS client) — skip CORS unless you add a web health dashboard later
 
-Reference ARCHITECTURE.md Security and Concurrency sections.
+Reference ARCHITECTURE.md Security section.
 
 Verification:
-- Local mode still works without token
-- Remote mode rejects missing/invalid JWT with 401
-- Valid JWT allows transcribe
-- CORS preflight from allowed origin succeeds
+- Local mode: no token needed
+- Remote mode: 401 without token, 200 with valid JWT
 ```
 
-### Prompt 2.3 — Gateway concurrency queue
+### Prompt 2.3 — Gateway concurrency limits
 
 ```
-Add ASR concurrency limits to the Compute Gateway.
+Add ASR and Ollama concurrency limits to the Compute Gateway.
 
 Requirements:
-- MAX_CONCURRENT_TRANSCRIPTIONS env (default 2)
-- When /transcribe exceeds limit: return 429 with JSON { error, retryAfterSeconds } or queue with timeout (document behavior — prefer 429 for v1)
-- MAX_CONCURRENT_OLLAMA env (default 1) for /translate
-- Include queue depth / active jobs in GET /health response: { transcribeActive, transcribeQueued, ollamaActive }
+- MAX_CONCURRENT_TRANSCRIPTIONS (default 2) → 429 when exceeded
+- MAX_CONCURRENT_OLLAMA (default 1) for translate / vocab-context / flashcard-entry
+- GET /health includes: transcribeActive, transcribeQueued, ollamaActive
 
 Verification:
-- health shows concurrency stats
-- third simultaneous transcribe request gets 429 when limit is 2
+- Third concurrent /transcribe gets 429 when limit is 2
+- health reports concurrency stats
 ```
 
-### Prompt 2.4 — Vercel compute token BFF
+### Prompt 2.4 — Cloud API compute token route
 
 ```
-Add server-side compute token issuance to apps/web/.
+Add compute token issuance to services/cloud-api/ for Electron to call the home gateway.
 
 Requirements:
-- POST /api/compute/token (auth required):
-  - Validate session via auth()
-  - Sign JWT with JWT_SECRET: { sub: userId, email, iat, exp } — 15 minute TTL
-  - Return { token, expiresAt }
-- GET /api/health/compute (auth required):
-  - Server-side fetch to COMPUTE_GATEWAY_URL/health (use server env, not NEXT_PUBLIC)
-  - Return { online: boolean, details } — do not expose gateway URL to client
-- Update apps/web/.env.example: JWT_SECRET, COMPUTE_GATEWAY_URL
-- src/lib/compute-token.ts: getComputeToken() client helper that calls POST /api/compute/token and caches until near expiry
+- POST /api/compute/token:
+  - Requires Electron API token (Bearer from Prompt 1.4) OR Auth.js session
+  - Signs JWT: { sub: userId, email, iat, exp } — 15 min TTL, HS256, JWT_SECRET
+  - Returns { token, expiresAt }
+- Optional GET /api/health/compute: server-side ping to COMPUTE_GATEWAY_URL, returns { online, details } without exposing URL
+- .env.example: JWT_SECRET, COMPUTE_GATEWAY_URL
 
-JWT_SECRET must match home PC gateway. COMPUTE_GATEWAY_URL is server-only.
+JWT_SECRET must match home PC gateway.
 
 Verification:
-- Unauthenticated request to /api/compute/token returns 401
-- Authenticated request returns valid JWT
-- /api/health/compute returns online:false gracefully when gateway unreachable
+- Unauthenticated → 401
+- Valid Electron API token → returns JWT
+- JWT validates on gateway in remote mode
 ```
 
-### Prompt 2.5 — Web compute client
+### Prompt 2.5 — Electron compute client (main process)
 
 ```
-Create a browser client for the home Compute Gateway in apps/web/.
+Create an Electron compute client in main.js for remote AI calls. Renderer unchanged for IPC surface.
 
 Requirements:
-- src/lib/compute-client.ts:
-  - getAuthHeaders(): fetch token from /api/compute/token, return Authorization header
-  - transcribe(audioBase64, language?): POST to COMPUTE_GATEWAY_URL — use NEXT_PUBLIC_COMPUTE_GATEWAY_URL for direct browser calls OR document that client calls gateway directly with public URL
-  - translate(text): POST /translate
-  - align(transcription, translation): POST /align
-  - checkHealth(): GET /health
-- Handle 401 (refresh token), 429 (retry with backoff), 503 (server warming up)
-- Types for transcribe/align responses matching existing renderer contracts
+- lib/compute-client.js (or section in main.js):
+  - getComputeToken(): POST cloudApiBaseUrl/api/compute/token with API token
+  - cache token until near expiry
+  - transcribe(audioBase64, language), translate(text), align(transcription, translation)
+  - POST to computeGatewayUrl with Authorization Bearer compute JWT
+  - handle 401 (refresh token), 429 (backoff), 503 (warming up)
+- electron-config.json:
+  - computeMode: "local" | "remote" (default "local")
+  - computeGatewayUrl (required when remote)
 
-Note: NEXT_PUBLIC_COMPUTE_GATEWAY_URL is the Cloudflare tunnel URL. JWT provides security, not URL secrecy.
+No IPC changes to renderer yet — next prompt wires handlers.
 
 Verification:
-- Client compiles and types match transcription_server response shapes
+- Unit-style test or manual script can call gateway through compute-client with valid JWT
 ```
 
-### Prompt 2.6 — Port subtitles UI (mic only)
+### Prompt 2.6 — Electron remote mode routing
 
 ```
-Port the Subtitles and Translation subapp to apps/web/ with browser microphone capture only.
+Wire Electron IPC handlers to use compute-client when computeMode is "remote", keeping local fallback.
 
 Requirements:
-- New route: src/app/subtitles/page.tsx (auth required)
-- Port UI layout from index.html + styles.css: two-column transcription/translation pairs, controls bar
-- Port core logic from renderer.js:
-  - transcriptionPairs state, sentence splitting, pair rendering, scroll/zoom behavior (adapt zoom for browser)
-  - translateText flow using compute-client.translate
-  - processTranscriptionResult equivalent wired to mic capture
-- Mic capture via getUserMedia + Web Audio API:
-  - Volume threshold (configurable, default from electron-config.json)
-  - Buffer ~3s chunks, encode float32 to base64, POST transcribe
-  - No loopback/system audio — show banner: "Microphone only. Use the desktop app for system audio capture."
-- On each transcription fragment: trackVocabFromText via useVocab()
-- Compute status banner: poll /api/health/compute, show offline/warming states
-- Disable start if compute offline
+- main.js:
+  - translate-text: remote → compute-client.translate; local → existing Ollama axios call
+  - extract-semantic-units: remote → compute-client.align; local → existing 127.0.0.1:8765/align
+  - generate-vocab-context, get-flashcard-entry: remote → gateway; local → existing Ollama
+- electron_backend.py OR transcription_client.py:
+  - When computeMode remote (read from config/env passed at spawn): POST transcribe to computeGatewayUrl instead of 127.0.0.1:8765
+  - Pass compute JWT via env var set by main before backend spawn, or proxy transcribe through main process IPC
+  - Local mode: unchanged — direct to local transcription_server
+- WASAPI capture stays in electron_backend.py on the client machine in BOTH modes
 
-Do NOT port detail modal / semantic alignment yet (next prompt).
-Do NOT port flashcards or tone-matching.
+Prefer smallest change that works. Document how JWT reaches Python backend.
 
 Verification:
-- Mic capture → transcribe → translate → display pairs works against local gateway
-- Vocab counts update during transcription session
+- computeMode local: identical behavior to pre-migration
+- computeMode remote: full subtitle pipeline works against gateway on another machine
+- Loopback audio capture still works in remote mode
 ```
 
-### Prompt 2.7 — Port semantic detail view
+### Prompt 2.7 — Cloudflare Tunnel + startup scripts
 
 ```
-Port the semantic unit detail modal to apps/web/subtitles using compute-client.align.
+Add Cloudflare Tunnel documentation and Windows startup scripts for the home compute stack.
 
 Requirements:
-- Port from renderer.js: openDetailView, extractSemanticUnits flow, matchChunksToText, collectMappedChunkIds, renderChunksAsCards, setupCorrelationHighlighting
-- Modal opens on pair click when both transcription and translation exist
-- Call compute-client.align(transcription, translation)
-- Show loading state: "Analyzing semantic units…"
-- Handle alignerReady false from health — show message if alignment warms up slowly
-- Cache result on transcriptionPairs[pairIndex] to avoid repeat calls
+- services/compute_gateway/README.md:
+  - cloudflared install, tunnel → localhost:8080
+  - example: compute.yourdomain.com
+  - remote mode env vars
+- scripts/start_compute_stack.ps1:
+  - Check/start transcription_server.py, Ollama, gateway --remote
+  - Reminder to run cloudflared
+- .env.example: JWT_SECRET, LINGUACODA_REMOTE_MODE, MAX_CONCURRENT_TRANSCRIPTIONS, OLLAMA_ENDPOINT
 
-Reference ARCHITECTURE.md Semantic Unit Alignment section and main.js extract-semantic-units handler.
+No secrets committed.
 
 Verification:
-- Clicking a completed pair opens modal with interactive chunk cards
-- Hover highlighting works across transcription and translation sides
+- README is copy-paste complete
+- Script has no PowerShell syntax errors
 ```
 
-### Prompt 2.8 — Cloudflare Tunnel documentation + startup scripts
+### Prompt 2.8 — Electron compute status UI
 
 ```
-Add documentation and Windows-friendly startup scripts for running the home compute stack in remote mode.
+Add compute server status to the Electron UI.
 
 Requirements:
-- services/compute_gateway/README.md section on Cloudflare Tunnel:
-  - Install cloudflared
-  - Create tunnel pointing to localhost:8080
-  - Example hostname: compute.yourdomain.com
-  - Env vars for remote mode
-- scripts/start_compute_stack.ps1 (PowerShell):
-  - Start transcription_server.py (background or separate window — document manual steps if needed)
-  - Verify Ollama is running
-  - Start compute gateway with --remote and env vars from a .env.example
-  - Print reminder to start cloudflared tunnel
-- .env.example for home PC: JWT_SECRET, ALLOWED_ORIGINS, LINGUACODA_REMOTE_MODE, MAX_CONCURRENT_TRANSCRIPTIONS
+- renderer.js + IPC:
+  - get-compute-status → main checks local /health or remote gateway /health (with token)
+  - Banner or status chip: "Compute: ready" / "warming up" / "offline"
+  - When remote and offline: disable Start Capture with clear message; vocab still works
+- Show computeMode (local/remote) in settings
 
-Do not commit secrets. Do not configure Cloudflare automatically (manual dashboard steps).
+Small UI change only.
 
 Verification:
-- README gives complete copy-paste setup for tunnel + gateway
-- Script runs without syntax errors (dry run / echo mode acceptable)
+- Local mode: status reflects transcription server ready state
+- Remote mode: offline gateway shows banner and blocks capture start
 ```
 
 ---
 
-## Phase 3 — Electron parity
+## Phase 3 — Polish & distribution
 
-### Prompt 3.1 — Electron cloud vocab sync
+### Prompt 3.1 — Settings UI
 
 ```
-Add cloud vocab sync to the existing Electron renderer without removing localStorage fallback.
+Add a Settings view to the Electron app for account and compute configuration.
 
 Requirements:
-- Add config in electron-config.json: webApiBaseUrl (e.g. https://your-app.vercel.app)
-- Create renderer-side module or section in renderer.js:
-  - On login (defer login UI to Prompt 3.2 — for now accept session token via config or dev prompt): GET/PUT webApiBaseUrl/api/vocab with Bearer/session cookie
-  - On app load: if authenticated, merge remote seenVocab with localStorage draft (per-word max)
-  - Replace direct localStorage.setItem('seenVocab') in trackVocabFromText with sync module that updates memory + local draft
-  - On window close / beforeunload: batch PUT to cloud
-  - Debounced 5-min save same as web
-- Keep localStorage as offline cache when not authenticated
+- New settings panel or modal in renderer.js:
+  - Account: email, Sign in / Sign out, last vocab sync time
+  - Compute: mode toggle local/remote (reads/writes electron-config.json via IPC), gateway URL field
+  - Cloud API base URL (advanced, default from config)
+- main.js IPC: get-settings, save-settings (validate URLs)
+- Restart may be required for compute mode change — show notice
 
-Do not break offline-only usage when webApiBaseUrl is unset.
+Match existing app styling from styles.css.
 
 Verification:
-- Electron vocab changes sync to same account as web when token configured
-- Works offline with localStorage when webApiBaseUrl empty
+- User can switch computeMode and save
+- Account section reflects auth state from Prompt 1.6
 ```
 
-### Prompt 3.2 — Electron Google auth flow
+### Prompt 3.2 — Offline and error UX
 
 ```
-Implement Sign in with Google for the Electron app, sharing accounts with the Vercel web app.
+Improve offline and error handling across Electron for cloud and compute failures.
 
 Requirements:
-- Menu or settings UI: Sign in / Sign out
-- OAuth flow: open system browser or BrowserWindow to web app auth URL
-- Use a dedicated callback page on Vercel: /auth/desktop-callback that displays a one-time code OR redirects to linguacoda://callback?token=...
-- Electron registers linguacoda:// protocol handler (main.js) to receive callback
-- Store session token securely (electron safeStorage or encrypted file)
-- Pass token to vocab sync module from Prompt 3.1
-- Sign out clears stored token
+- renderer.js:
+  - Cloud API unreachable: vocab uses local draft, non-blocking toast "Vocab saved locally"
+  - Compute 429: show retry message, don't crash capture loop
+  - Ollama/gateway timeout: show pair with transcription only (existing pattern)
+  - Re-login prompt when API token expired (401 on vocab sync)
+- main.js: consistent error shapes from compute-client → IPC
 
-Prefer simple reliable flow over perfect UX for v1. Document manual test steps.
+Reference ARCHITECTURE.md Error Handling table.
 
 Verification:
-- User can sign in via Google in Electron
-- Same Google account sees same vocab on web and desktop
+- Airplane mode: app usable, vocab in localStorage draft
+- Invalid API token: user prompted to sign in again
 ```
 
-### Prompt 3.3 — Electron compute gateway routing
+### Prompt 3.3 — Desktop OAuth callback hardening
 
 ```
-Route Electron AI calls through the Compute Gateway when configured, keeping local fallback.
+Harden the Electron OAuth and token flow for production.
 
 Requirements:
-- electron-config.json additions: computeGatewayUrl (optional), useComputeGateway (boolean)
-- main.js changes:
-  - translate-text IPC: if useComputeGateway, POST to computeGatewayUrl/translate with JWT (obtain from web API /api/compute/token using stored session)
-  - extract-semantic-units IPC: if useComputeGateway, POST to /align on gateway
-  - Fallback: existing local Ollama + 127.0.0.1:8765 behavior when not configured
-- Python backend (electron_backend.py): keep direct local transcription_server when on same machine (no change) OR optionally route through gateway — document tradeoff, prefer unchanged local path for latency
+- One-time codes expire in 5 minutes
+- ApiToken rotation on sign-in (invalidate old tokens)
+- linguacoda:// handler validates state param to prevent CSRF
+- Cloud API /auth/desktop-callback: clear user-facing success/error pages
+- Document Google OAuth redirect URIs needed for production domain
 
 Verification:
-- With useComputeGateway false: Electron behaves exactly as before
-- With useComputeGateway true and valid token: translation and alignment work via remote gateway
+- Replayed callback code fails
+- Sign in on second machine doesn't invalidate first unless designed to
 ```
 
-### Prompt 3.4 — Electron UI parity messaging
+### Prompt 3.4 — Distribution docs (optional installer)
 
 ```
-Update Electron UI to clarify relationship between desktop and web clients.
+Document Electron app distribution; optional electron-builder scaffold.
 
 Requirements:
-- Menu or about section:
-  - "System audio capture (loopback) — desktop only"
-  - Link to web app URL
-  - Show signed-in email when authenticated
-- Web app subtitles page already shows mic-only banner — ensure consistent messaging
-
-Small copy/styling changes only. No new features.
+- README or DISTRIBUTION.md:
+  - How end users install the desktop app
+  - Required: Python, Ollama, transcription models (link existing setup docs)
+  - cloudApiBaseUrl baked in or set on first run
+- Optional: electron-builder config stub in package.json — do not publish yet
+- Vercel cloud API deployment remains separate from desktop installer
 
 Verification:
-- User understands desktop vs web capability differences
+- New developer can follow docs to run desktop + pointed cloud API
 ```
 
 ---
 
 ## Phase 4 — Hardening
 
-### Prompt 4.1 — Structured logging and error responses
+### Prompt 4.1 — Structured logging (gateway + cloud API)
 
 ```
-Add structured logging to the Compute Gateway and consistent error JSON across services.
+Add structured logging to Compute Gateway and cloud API.
 
 Requirements:
-- Gateway logs: timestamp, level, endpoint, userId (from JWT sub), duration_ms, status_code
-- Standard error shape: { error: string, code?: string, retryAfterSeconds?: number }
-- apps/web compute-client: surface user-friendly messages for 401, 429, 503, 413
-- Do not log JWTs or audio payloads
+- Gateway logs: timestamp, endpoint, userId (JWT sub), duration_ms, status
+- Cloud API: log vocab PUT size, auth failures (no tokens in logs)
+- Standard error JSON: { error, code?, retryAfterSeconds? }
+- Electron compute-client: map errors to user-facing strings in IPC responses
 
 Verification:
-- Failed transcribe logs one structured line with userId
-- UI shows meaningful message on 429
+- Failed remote transcribe produces one structured log line with userId
 ```
 
 ### Prompt 4.2 — Production safety guards
 
 ```
-Add production safety guards to apps/web/.
+Add production safety guards to services/cloud-api/.
 
 Requirements:
-- Dev pages (/dev/*) return 404 unless NEXT_PUBLIC_ENABLE_DEV_PAGES=true
-- /api/compute/token: optional rate limit per user (10/min)
-- Vocab PUT: validate seenVocab is object with numeric values, reject absurd payload size (>500KB)
-- Middleware or route guard: require auth on /vocab, /subtitles
+- /api/compute/token rate limit: 10/min per user
+- Vocab PUT validation: numeric values only, max 500KB
+- /api/health public; all other routes authenticated
+- Dev test page 404 in production unless ENABLE_DEV_PAGES=true
 
 Verification:
-- Dev pages 404 in production config
-- Invalid vocab payload returns 400
+- Oversized vocab payload → 413 or 400
+- Token endpoint rate limited
 ```
 
 ### Prompt 4.3 — ARCHITECTURE.md sync check
 
 ```
-Review the codebase against ARCHITECTURE.md and update ARCHITECTURE.md only where implementation diverged.
+Review codebase against ARCHITECTURE.md and update ARCHITECTURE.md only where implementation diverged.
 
 Requirements:
-- Compare implemented routes, env vars, file paths, and data models to ARCHITECTURE.md
-- Update ARCHITECTURE.md with actual paths, any renamed endpoints, and "Implemented" notes per phase
-- Do not rewrite the whole doc — surgical updates only
-- Add a "Implementation status" table at the top with checkboxes per phase
+- Compare routes, env vars, paths, data models to ARCHITECTURE.md
+- Surgical updates + "Implementation status" table at top of ARCHITECTURE.md
+- Remove any stale references to apps/web or browser UI port
 
 Verification:
-- ARCHITECTURE.md accurately reflects the repo
-- No stale references to files that don't exist
+- ARCHITECTURE.md matches repo
 ```
 
 ### Prompt 4.4 — Load test script (manual)
 
 ```
-Create a manual load test script for concurrent transcription sessions.
+Create manual load test for concurrent Electron sessions against remote gateway.
 
 Requirements:
 - scripts/load_test_compute.py:
-  - Accept --url, --jwt, --sessions N, --duration seconds
-  - Simulate N concurrent clients posting small transcribe payloads (or health checks if no sample audio)
-  - Report: success count, 429 count, avg latency, errors
-- Document in services/compute_gateway/README.md how to run against local and remote gateway
-- Do not run the script automatically in CI
+  - --url, --jwt, --sessions N, --duration
+  - Concurrent POST /transcribe (or /health)
+  - Report: success, 429 count, avg latency
+- Document in services/compute_gateway/README.md
+
+Do not add to CI.
 
 Verification:
-- Script runs with --help
-- With 3 sessions and limit 2, reports 429s
+- --help works
+- 3 sessions with limit 2 reports 429s
 ```
 
 ---
 
 ## Optional follow-up prompts
 
-Use these after the core migration is complete.
+Use after core migration is complete.
 
-### Optional A — WebSocket streaming transcription
+### Optional A — Read-only vocab dashboard on Vercel
 
 ```
-Replace REST-per-chunk transcription in apps/web with WebSocket streaming on the Compute Gateway.
+Add an optional read-only web page to services/cloud-api showing vocab stats for signed-in users.
 
 Requirements:
-- Gateway: WS /stream with JWT auth on connect
-- Client sends audio frames; server pushes transcription events
-- Fallback to REST if WebSocket unavailable
-- Update ARCHITECTURE.md data flow diagram
+- /dashboard route: total words seen, per-level breakdown — NOT a replacement for Electron vocab grid
+- Auth required
+- No audio, no capture, no subtitles
 
-Verify end-to-end mic session with lower perceived latency.
+Verify stats match Electron for same account.
 ```
 
-### Optional B — Flashcards on web
+### Optional B — electron-builder installer
 
 ```
-Port the flashcards feature from renderer.js to apps/web using compute gateway for Ollama flashcard entries.
+Add electron-builder for Windows installer packaging.
 
 Requirements:
-- Port flashcard UI and logic (getFlashcardEntry, round flow)
-- Cache flashcardEntryCache in localStorage only (not DB)
-- Require auth + compute online
+- package.json build config, icons, NSIS or portable
+- Bundle or document Python backend dependency
+- Do not bundle Ollama models
 
-Verify flashcard rounds work for seen vocab words.
+Verify installer launches app on clean Windows VM.
 ```
 
 ### Optional C — Vercel custom domain
 
 ```
-Document and configure custom domain setup for the Vercel deployment.
+Document custom domain for cloud API.
 
 Requirements:
-- Update apps/web/README with DNS steps
-- List all Google OAuth URIs that must be updated
-- Set AUTH_URL to custom domain
+- services/cloud-api/README DNS steps
+- Update Google OAuth URIs, AUTH_URL, electron-config cloudApiBaseUrl default
+- Update linguacoda:// callback URLs if domain-specific
 
-Verify login works on custom domain.
+Verify Electron sign-in works with custom domain.
+```
+
+### Optional D — WebSocket streaming (gateway)
+
+```
+Add optional WebSocket /stream on gateway for lower-latency transcription.
+
+Requirements:
+- JWT on connect
+- Electron compute-client uses WS in remote mode, REST fallback
+- Local mode unchanged
+
+Verify remote mode session latency improves.
 ```
 
 ---
@@ -636,17 +641,29 @@ Verify login works on custom domain.
 
 | Phase | Done when |
 |-------|-----------|
-| **0** | `apps/web` runs; Electron unchanged |
-| **1** | Google login on Vercel; vocab syncs across devices |
-| **2** | Mic transcription via tunnel; JWT-protected gateway |
-| **3** | Electron shares account + vocab; optional gateway routing |
+| **0** | `services/cloud-api` runs; Electron unchanged |
+| **1** | Google login in Electron; vocab syncs across desktop installs via cloud API |
+| **2** | Remote computeMode works through tunnel; local mode unchanged; WASAPI capture on client |
+| **3** | Settings UI, offline UX, distribution docs |
 | **4** | Logging, guards, docs match code |
+
+---
+
+## What NOT to build
+
+| Do not | Reason |
+|--------|--------|
+| Port subtitles UI to Next.js | Electron is the only client; WASAPI requires desktop |
+| Port vocab grid to Vercel | Same |
+| Browser getUserMedia capture | Inferior to WASAPI loopback; multi-browser burden |
+| Expose transcription_server.py directly | Use compute gateway |
+| Sync pinyinCache / flashcardEntryCache to DB | Regenerable; keep localStorage |
 
 ---
 
 ## Tips for effective prompting
 
-- **Attach files**: `@ARCHITECTURE.md`, `@renderer.js`, `@main.js`, `@styles.css` when porting UI.
-- **Scope control**: If a prompt does too much, say "only implement Prompt 1.3, do not touch UI."
-- **Fix forward**: If something breaks, use a focused prompt: "Fix PUT /api/vocab merge logic; tests: ..."
-- **Preserve behavior**: When porting from `renderer.js`, say "match existing behavior exactly unless noted in ARCHITECTURE.md."
+- **Attach files**: `@ARCHITECTURE.md`, `@renderer.js`, `@main.js`, `@electron_backend.py`, `@transcription_client.py` for Electron and remote routing work.
+- **Scope control**: "Only implement Prompt 1.7; do not touch compute gateway."
+- **Preserve local mode**: Every Phase 2 prompt should leave `computeMode: local` behavior identical to main-branch today.
+- **WASAPI first**: If a change would move audio capture off the client machine, reject it — only ASR/LLM compute moves to the gateway in remote mode.

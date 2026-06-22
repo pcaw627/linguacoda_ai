@@ -1,27 +1,28 @@
 # LinguaCoda AI — Architecture
 
-This document describes the system design for LinguaCoda: the current Electron desktop app, the target production deployment, and how the two coexist during migration.
+This document describes the system design for LinguaCoda: the Electron desktop app as the **primary and only end-user client**, the cloud services that back accounts and persistence, and the optional home compute server for shared AI workloads.
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Production Target Architecture](#production-target-architecture)
-3. [Recommended Additions & Modifications](#recommended-additions--modifications)
-4. [Component Responsibilities](#component-responsibilities)
-5. [Authentication & Sessions](#authentication--sessions)
-6. [Data Model & Vocab Sync](#data-model--vocab-sync)
-7. [Home Compute Gateway (Remote Backend)](#home-compute-gateway-remote-backend)
-8. [Web Frontend (Vercel)](#web-frontend-vercel)
-9. [Security](#security)
-10. [Concurrency & Rate Limiting](#concurrency--rate-limiting)
-11. [Desktop Client (Electron) — Current & Future](#desktop-client-electron--current--future)
-12. [AI Components](#ai-components)
-13. [Data Flows](#data-flows)
-14. [Configuration & Persistence](#configuration--persistence)
-15. [Migration Phases](#migration-phases)
-16. [Error Handling & Resilience](#error-handling--resilience)
+2. [Why Electron, Not a Browser](#why-electron-not-a-browser)
+3. [Production Target Architecture](#production-target-architecture)
+4. [Recommended Additions & Modifications](#recommended-additions--modifications)
+5. [Component Responsibilities](#component-responsibilities)
+6. [Authentication & Sessions](#authentication--sessions)
+7. [Data Model & Vocab Sync](#data-model--vocab-sync)
+8. [Home Compute Gateway (Remote Backend)](#home-compute-gateway-remote-backend)
+9. [Cloud API (Vercel)](#cloud-api-vercel)
+10. [Security](#security)
+11. [Concurrency & Rate Limiting](#concurrency--rate-limiting)
+12. [Desktop Client (Electron)](#desktop-client-electron)
+13. [AI Components](#ai-components)
+14. [Data Flows](#data-flows)
+15. [Configuration & Persistence](#configuration--persistence)
+16. [Migration Phases](#migration-phases)
+17. [Error Handling & Resilience](#error-handling--resilience)
 
 ---
 
@@ -29,25 +30,26 @@ This document describes the system design for LinguaCoda: the current Electron d
 
 LinguaCoda is a language-learning app centered on **real-time transcription**, **translation**, **semantic alignment**, and an **HSK vocab tracker**.
 
-Today the project is an **Electron desktop app** where all compute (ASR, alignment, LLM translation) runs locally on the user's machine. The production target splits the system into three tiers:
+The **Electron desktop app is the product**. It is the only client users install and run. It retains full **WASAPI** access (microphone + system/loopback audio), the existing Python audio backend, and the current renderer UI — extended with Google sign-in and cloud vocab sync.
+
+Production adds two server-side tiers; neither replaces the desktop UI:
 
 | Tier | Host | Role |
 |------|------|------|
-| **Web client** | Vercel | Browser UI, Google login, per-user sessions, vocab persistence |
-| **Cloud API** | Vercel (serverless) or managed DB host | Auth callbacks, vocab read/write, optional BFF proxy to home compute |
-| **Home compute gateway** | Personal PC | GPU/CPU-heavy AI: SenseVoice ASR, SimAlign, Ollama translation |
+| **Electron desktop** | User's machine | Full UI, WASAPI capture, IPC to local or remote AI |
+| **Cloud API** | Vercel (serverless) | Google OAuth callbacks, vocab read/write, compute token issuance |
+| **Home compute gateway** | Operator's PC (optional remote mode) | Shared GPU/CPU AI: SenseVoice ASR, SimAlign, Ollama |
 
 ```mermaid
 flowchart TB
     subgraph clients [Clients]
-        Browser[Web Browser on Vercel]
-        Electron[Electron Desktop optional]
+        Electron[Electron Desktop - primary client]
     end
 
     subgraph cloud [Cloud - Vercel + DB]
-        WebApp[Next.js App]
+        CloudAPI[Cloud API - Next.js API routes only]
         Auth[Auth.js - Google OAuth]
-        VocabAPI[Vocab API Routes]
+        VocabAPI[Vocab + Token API]
         DB[(PostgreSQL)]
     end
 
@@ -57,176 +59,186 @@ flowchart TB
         Ollama[Ollama LLM]
     end
 
-    Browser --> WebApp
-    Electron --> WebApp
-    Electron --> Gateway
-    WebApp --> Auth
-    WebApp --> VocabAPI
+    Electron -->|Google OAuth via system browser| CloudAPI
+    Electron -->|vocab sync + compute tokens| VocabAPI
+    Electron -->|AI requests with JWT| Gateway
+    CloudAPI --> Auth
     VocabAPI --> DB
-    WebApp -.->|short-lived token| Gateway
     Gateway --> TS
     Gateway --> Ollama
 ```
 
-**Why split this way:** SenseVoice, SimAlign/XLM-R, and Ollama are too heavy for Vercel serverless and require local GPU/CPU. User accounts and vocab state belong in a managed database. The browser cannot access loopback audio capture — that remains an Electron-only capability.
+**Why split this way:** SenseVoice, SimAlign/XLM-R, and Ollama are too heavy for Vercel serverless. User accounts and vocab state belong in a managed database. **WASAPI loopback capture requires native desktop access** — browsers cannot reliably provide system-audio capture across Windows versions, and supporting Chrome/Firefox/Safari separately would multiply effort for an inferior experience.
+
+---
+
+## Why Electron, Not a Browser
+
+| Concern | Electron desktop | Web browser |
+|---------|------------------|-------------|
+| **WASAPI loopback** (capture system/app audio) | Yes — `electron_backend.py` / `soundcard_capture.py` | No — OS and browser security model blocks this |
+| **Microphone capture** | Yes | Yes, but not the primary use case |
+| **Single runtime to test** | Chromium via Electron | Chrome, Firefox, Safari, mobile… |
+| **Existing codebase** | `renderer.js`, IPC, Python backend already work | Full UI + audio stack would need a rewrite |
+| **Offline vocab** | `localStorage` + local draft | Same possible, but no WASAPI benefit |
+| **Distribution** | Installer / portable app | URL, but feature-incomplete |
+
+**Decision:** Do not port the Language Learning Suite UI to a browser. Vercel hosts **API routes and OAuth callbacks only** — not the transcription/subtitles experience. A minimal landing or download page on Vercel is optional.
 
 ---
 
 ## Production Target Architecture
 
-### Goals (from product requirements)
+### Goals
 
-1. **Remote backend flag** — run dedicated AI backend on a personal PC, reachable from the public internet, with protection (tunneling, rate limits) and support for multiple concurrent frontend sessions.
-2. **Web frontend on Vercel** — users log in and get their own session in the browser.
+1. **Remote backend flag** — run dedicated AI backend on a personal PC, reachable from the internet, with tunneling, rate limits, and support for multiple concurrent **Electron** sessions.
+2. **Electron remains the client** — users install and run the desktop app; all capture and UI stay in Electron.
 3. **Google OAuth** — external identity provider only (no custom passwords in v1).
-4. **Per-user database** — vocab tracker state persists across devices; batch sync on session end (not per-character).
+4. **Per-user database** — vocab tracker state persists across devices (multiple desktops/laptops); batch sync on app close (not per-character).
 
 ### High-level request paths
 
-**Vocab (always cloud):**
+**Auth (one-time per session):**
 ```
-Browser → Vercel API (/api/vocab) → PostgreSQL
-```
-
-**AI compute (home PC when online):**
-```
-Browser → Vercel BFF (optional) → Home Compute Gateway → Transcription Server / Ollama
+Electron → system browser → Vercel /api/auth/* → Google → callback → linguacoda:// or token handoff → Electron
 ```
 
-The BFF (Backend-for-Frontend) on Vercel is recommended: it holds the home gateway URL as a server secret, mints short-lived compute tokens for authenticated users, and avoids exposing the home endpoint or long-lived secrets to the browser.
+**Vocab (cloud):**
+```
+Electron main/renderer → Vercel /api/vocab → PostgreSQL
+```
+
+**AI compute (local or remote):**
+```
+# Same machine (default / dev)
+Electron → IPC → Python backend → transcription_server (loopback)
+Electron → IPC → main.js → Ollama (loopback)
+
+# Remote mode (shared home server)
+Electron → HTTPS → Home Compute Gateway → transcription_server / Ollama (loopback on server)
+```
 
 ---
 
 ## Recommended Additions & Modifications
 
-These go beyond the four stated requirements but address gaps that will surface in production.
-
 ### 1. Unified Compute Gateway (instead of exposing `transcription_server.py` directly)
 
-Do **not** port-forward the raw transcription server to the internet. Wrap it in a **Compute Gateway** service that:
+Wrap the transcription server and Ollama in a **Compute Gateway**:
 
-- Validates **user JWTs** (or short-lived compute tokens issued by Vercel after Google login).
-- Applies **rate limiting**, **CORS**, and **request size limits** in one place.
-- Proxies to the existing transcription server (`/transcribe`, `/align`) and Ollama (`/api/generate`).
-- Exposes a single **`--remote`** / `LINGUACODA_REMOTE_MODE=1` entry point.
+- Validates **user JWTs** (issued by the Vercel cloud API after Google login).
+- Applies **rate limiting** and **request size limits**.
+- Proxies `/transcribe`, `/align`, and Ollama-backed `/translate`, etc.
+- Exposes `--remote` / `LINGUACODA_REMOTE_MODE=1`.
 
-The existing local Bearer token (`.transcription_server.token`) stays **loopback-only** between the gateway and the transcription server.
+The local Bearer token (`.transcription_server.token`) stays **loopback-only** on the home PC.
 
 ### 2. Cloudflare Tunnel over raw port forwarding
 
-Prefer a **Cloudflare Tunnel** (`cloudflared`) to expose the home gateway:
+Expose the home gateway via **Cloudflare Tunnel** — no open router ports, HTTPS, edge DDoS protection.
 
-- No open inbound ports on the home router.
-- Built-in DDoS mitigation and optional WAF/rate rules at the edge.
-- Stable HTTPS hostname (e.g. `compute.yourdomain.com`) without dynamic DNS.
+### 3. Slim cloud API on Vercel (not a full web app)
 
-If port forwarding is used instead, restrict source IPs where possible, terminate TLS at a reverse proxy (Caddy/nginx), and never bind AI services to `0.0.0.0` without the gateway in front.
+Deploy a minimal **Next.js API app** (`services/cloud-api/` or `apps/api/`):
 
-### 3. Next.js on Vercel (not a static SPA alone)
+- Auth.js Google OAuth routes
+- `GET/PUT /api/vocab`
+- `POST /api/compute/token` — short-lived JWT for the home gateway
+- Optional: static landing page with download link
 
-Use **Next.js** so Vercel can host:
+**Do not** port `renderer.js`, subtitles UI, or audio capture to the web.
 
-- **Auth.js** Google OAuth callbacks (`/api/auth/*`).
-- **Server-side vocab API** routes with DB credentials never shipped to the client.
-- Optional **BFF proxy** to the home compute gateway.
+### 4. Electron auth via system browser + custom protocol
 
-A plain static export cannot securely hold database credentials or perform OAuth token exchange.
+Use the OS default browser for Google OAuth (most secure, no embedded WebView cookie issues):
 
-### 4. WebSocket or SSE for live transcription in the browser
+1. Electron opens `https://api.linguacoda.app/api/auth/signin` (or dedicated `/auth/desktop`).
+2. After Google login, Vercel redirects to `linguacoda://auth/callback?...`.
+3. Electron registers the `linguacoda://` protocol handler in `main.js`.
+4. Session token stored via `safeStorage` or encrypted file.
 
-The desktop app streams transcription over Electron IPC. The browser needs **WebSocket** or **Server-Sent Events** from the compute gateway for the same live experience. REST-only polling is a poor fit for continuous audio sessions.
+### 5. Compute routing modes in Electron
 
-### 5. Browser audio vs Electron audio
+| Mode | When | Transcription | Translation / align |
+|------|------|---------------|---------------------|
+| **Local** | Dev or single-user home PC | Python backend → local `transcription_server` | `main.js` → local Ollama |
+| **Remote** | Client on different machine than AI server | `main.js` or backend → remote gateway `/transcribe` | gateway `/translate`, `/align` |
 
-| Capability | Web (Vercel) | Electron |
-|------------|--------------|----------|
-| Microphone capture | `getUserMedia` | Yes |
-| System/loopback audio | No (OS/browser restriction) | Yes (`electron_backend.py`) |
-| Vocab tracker | Yes (cloud sync) | Yes (cloud sync) |
-| Full subtitle pipeline | Yes (mic only) | Yes (mic + loopback) |
-
-Document this limitation in the web UI so users know the desktop app is required for system-audio capture.
+Config in `electron-config.json`: `computeMode: "local" | "remote"`, `cloudApiBaseUrl`, `computeGatewayUrl`.
 
 ### 6. Vocab conflict resolution
 
-With multiple devices, two sessions may update the same word offline. Use **last-write-wins at the document level** for v1 (simplest), or **per-word max count merge** (recommended):
+Per-word max merge across devices:
 
 ```
 merged[word] = max(local[word], remote[word])
 ```
 
-Store a `updated_at` timestamp on the vocab blob for debugging and future CRDT work.
-
 ### 7. Debounced backup sync (in addition to close-batch)
 
-Batch-on-close alone is risky (tab crash, mobile browser kill). Also sync:
+Sync vocab on:
 
-- On `visibilitychange` → `hidden`
-- On `beforeunload` / `pagehide` via `navigator.sendBeacon`
+- App window close (`before-quit` / `window-close` IPC)
 - Debounced every **5 minutes** during active use
+- Manual "Sync now" in settings (optional)
 
 ### 8. Offline / home-PC-down UX
 
-The vocab tracker and HSK dictionary can work offline (dictionary is static JSON). Transcription/translation should show a clear **“Compute server offline”** state with retry, since the home PC may sleep or lose power.
+Vocab tracker and HSK dictionary work offline. Transcription/translation show **"Compute server offline"** when remote gateway is unreachable; local mode unaffected.
 
-### 9. Keep Electron as a first-class client
+### 9. Do not persist LLM-derived caches in the database (v1)
 
-Electron should adopt the same Google auth and cloud vocab sync, while retaining local loopback capture and optional direct loopback to the home gateway when running on the same machine.
-
-### 10. Do not persist LLM-derived caches in the database (v1)
-
-`pinyinCache` and `flashcardEntryCache` are regenerable. Only sync **`seenVocab`** (`{ word: count }`) to the database initially. This keeps payloads small and avoids stale LLM content across model versions.
+Only sync **`seenVocab`**. Keep `pinyinCache` and `flashcardEntryCache` in `localStorage`.
 
 ---
 
 ## Component Responsibilities
 
-### Web Frontend (Vercel — Next.js)
+### Electron Desktop (primary client — repo root)
 
-- Host the Language Learning Suite UI (ported from `renderer.js` / `index.html`).
-- Google sign-in via Auth.js; maintain HTTP-only session cookie.
-- Load HSK dictionary from static assets (same `hsk_dictionary.json`).
-- Vocab tracker: read from DB on login, mutate in memory during session, batch sync on close/interval.
-- Audio capture via Web Audio API / `MediaRecorder`; stream chunks to compute gateway.
-- Pinyin generation via `pinyin-pro` in the browser (already a dependency) — no Ollama needed for basic pinyin.
+**Unchanged core:**
+- `main.js` — window, IPC, process lifecycle
+- `renderer.js` — full UI (menu, subtitles, vocab, flashcards)
+- `preload.js` — `window.electronAPI` bridge
+- `electron_backend.py` — WASAPI capture, buffering, transcription client
+- `index.html`, `styles.css`
 
-### Cloud API (Vercel serverless routes)
+**New / extended:**
+- Google sign-in UI (settings or menu)
+- Cloud vocab sync module (renderer + IPC helpers in main)
+- Compute mode switch: local vs remote gateway
+- Remote mode: main process obtains compute JWT from cloud API, attaches to gateway requests
+- Protocol handler: `linguacoda://`
+
+### Cloud API (Vercel — minimal Next.js)
 
 | Route | Purpose |
 |-------|---------|
 | `GET/POST /api/auth/*` | Auth.js Google OAuth |
 | `GET /api/vocab` | Fetch user's `seenVocab` blob |
-| `PUT /api/vocab` | Upsert vocab blob (batch) |
-| `POST /api/compute/token` | Issue short-lived JWT for home gateway (optional BFF) |
-| `GET /api/health/compute` | Ping home gateway; surface online/offline to UI |
+| `PUT /api/vocab` | Upsert vocab blob (batch, max merge) |
+| `POST /api/compute/token` | Issue short-lived JWT for home gateway |
+| `GET /api/health` | DB connectivity check |
+| `GET /auth/desktop-callback` | OAuth handoff page for Electron (optional) |
+
+No subtitles, no audio, no vocab grid UI on Vercel.
 
 ### Database (PostgreSQL)
 
-Recommended hosts: **Neon**, **Supabase**, or **Vercel Postgres**. Single region close to the user base.
+Neon, Supabase, or Vercel Postgres.
 
-### Home Compute Gateway (new service on personal PC)
+### Home Compute Gateway (`services/compute_gateway/`)
 
 | Flag | Behavior |
 |------|----------|
-| Default (local) | Binds `127.0.0.1`; Electron/desktop use only |
-| `--remote` / `LINGUACODA_REMOTE_MODE=1` | Binds behind tunnel; validates user tokens; enables CORS for Vercel origin |
+| Default (local) | `127.0.0.1`; Electron on same machine uses directly |
+| `--remote` | Behind Cloudflare Tunnel; JWT required; rate limits |
 
-Responsibilities:
-
-- Authenticate requests (JWT from Auth.js or compute token from BFF).
-- Rate limit per user and per IP.
-- Queue concurrent ASR jobs (GPU-bound); return `429` when saturated.
-- Proxy `/transcribe`, `/align` to `transcription_server.py` (loopback + local token).
-- Proxy `/translate`, `/vocab-context`, `/flashcard-entry` to Ollama (same prompts as `main.js` today).
-- WebSocket endpoint for streaming transcription events.
+Proxies to `transcription_server.py` and Ollama. Auth is **JWT-based** (not browser CORS) — Electron main process sends `Authorization: Bearer`.
 
 ### Transcription Server (existing — `transcription_server.py`)
 
-Unchanged in responsibility. In remote mode it remains **localhost-only** (`127.0.0.1:8765`); only the gateway talks to it.
-
-### Electron Desktop (existing — evolution path)
-
-Current responsibilities preserved. Future: add Google login, cloud vocab sync, and configurable compute endpoint (local gateway vs remote tunnel URL).
+Unchanged. Stays on `127.0.0.1:8765` on the home PC; only the gateway talks to it in production.
 
 ---
 
@@ -234,38 +246,32 @@ Current responsibilities preserved. Future: add Google login, cloud vocab sync, 
 
 ```mermaid
 sequenceDiagram
-    participant U as User Browser
-    participant V as Vercel Next.js
+    participant E as Electron App
+    participant B as System Browser
+    participant V as Vercel Cloud API
     participant G as Google OAuth
     participant DB as PostgreSQL
     participant H as Home Gateway
 
-    U->>V: Click Sign in with Google
+    E->>B: Open sign-in URL
+    B->>V: /api/auth/signin
     V->>G: OAuth redirect
     G->>V: Authorization code
-    V->>G: Exchange for tokens
-    V->>DB: Upsert user record
-    V->>U: Set HTTP-only session cookie
+    V->>DB: Upsert user
+    V->>B: Redirect linguacoda://callback
+    B->>E: Protocol handler receives token
+    E->>E: Store session in safeStorage
 
-    Note over U,H: AI compute session
-    U->>V: Request compute token
-    V->>U: Short-lived JWT 5-15 min
-    U->>H: API call with JWT
-    H->>H: Validate JWT signature
-    H->>U: Transcription / translation result
+    Note over E,H: Remote compute
+    E->>V: POST /api/compute/token (session auth)
+    V->>E: Short-lived JWT
+    E->>H: AI request + JWT
+    H->>E: Result
 ```
 
-**Auth.js (NextAuth v5)** with Google provider:
-
-- **Session**: HTTP-only, Secure, SameSite=Lax cookie on the Vercel domain.
-- **User record**: `id`, `email`, `name`, `image`, `google_sub`, `created_at`.
+- **Cloud session**: API key or refresh token stored in Electron `safeStorage`; sent as `Authorization: Bearer` or cookie on vocab/token requests from main process.
+- **Compute JWT**: 15-minute HS256 token from `/api/compute/token`; used only for home gateway.
 - **No passwords** in v1.
-
-**Compute tokens** (recommended):
-
-- Vercel signs a short-lived JWT after session validation.
-- Home gateway validates with a shared `JWT_SECRET` (or JWKS if using asymmetric keys).
-- Prevents anonymous internet access to expensive AI endpoints.
 
 ---
 
@@ -274,7 +280,6 @@ sequenceDiagram
 ### Schema (v1)
 
 ```sql
--- Managed by Auth.js adapter
 CREATE TABLE users (
   id            TEXT PRIMARY KEY,
   email         TEXT UNIQUE NOT NULL,
@@ -286,29 +291,27 @@ CREATE TABLE users (
 
 CREATE TABLE user_vocab (
   user_id     TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  seen_vocab  JSONB NOT NULL DEFAULT '{}',  -- { "你好": 3, "谢谢": 1 }
+  seen_vocab  JSONB NOT NULL DEFAULT '{}',
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-`seen_vocab` mirrors today's `localStorage.seenVocab` shape: `{ [word: string]: number }`.
+### Sync protocol (Electron)
 
-### Sync protocol
-
-1. **On login**: `GET /api/vocab` → hydrate in-memory `seenVocab`; merge with any local draft using per-word max count.
-2. **During session**: updates stay in memory (and optionally `localStorage` as a offline draft); `trackVocabFromText` behavior unchanged.
-3. **On sync trigger** (close, hidden, debounce, beacon): `PUT /api/vocab` with full blob or delta + `updated_at`.
-4. **Server merge**: `merged[w] = max(client[w], server[w])` per word; update `updated_at`.
+1. **On login**: `GET /api/vocab` → merge with `localStorage` draft (per-word max).
+2. **During session**: `trackVocabFromText` updates in-memory + local draft.
+3. **On sync trigger** (app close, 5-min debounce): `PUT /api/vocab`.
+4. **Server merge**: per-word max; update `updated_at`.
 
 ### What stays local-only
 
 | Data | Storage | Synced? |
 |------|---------|---------|
-| `seenVocab` | DB | Yes |
+| `seenVocab` | PostgreSQL | Yes |
 | `pinyinCache` | localStorage | No (v1) |
 | `flashcardEntryCache` | localStorage | No (v1) |
-| Font size / zoom | localStorage | No |
-| Audio device selection | local (Electron) | No |
+| Font size / zoom | local file / localStorage | No |
+| Audio device selection | `device_cache.json` | No |
 
 ---
 
@@ -317,26 +320,27 @@ CREATE TABLE user_vocab (
 ### Startup
 
 ```bash
-# Local desktop development (default)
-python compute_gateway.py
+# Local (Electron on same machine)
+python -m services.compute_gateway.main
 
-# Production remote mode (behind Cloudflare Tunnel)
+# Remote (internet-facing via Cloudflare Tunnel)
 LINGUACODA_REMOTE_MODE=1 \
 JWT_SECRET=... \
-ALLOWED_ORIGINS=https://your-app.vercel.app \
-python compute_gateway.py --remote
+python -m services.compute_gateway.main --remote
 ```
 
-### Suggested API surface
+### API surface
 
 | Method | Path | Auth | Proxies to |
 |--------|------|------|------------|
-| `GET` | `/health` | None | Gateway + downstream readiness |
+| `GET` | `/health` | Optional | Gateway + downstream readiness |
 | `POST` | `/transcribe` | JWT | `transcription_server:8765/transcribe` |
 | `POST` | `/align` | JWT | `transcription_server:8765/align` |
 | `POST` | `/translate` | JWT | Ollama `/api/generate` |
-| `POST` | `/vocab-context` | JWT | Ollama (optional) |
-| `WS` | `/stream` | JWT | Audio session streaming |
+| `POST` | `/vocab-context` | JWT | Ollama |
+| `POST` | `/flashcard-entry` | JWT | Ollama |
+
+No WebSocket required for v1 — Electron can keep REST-per-chunk via main process or Python backend, same as today.
 
 ### Infrastructure on home PC
 
@@ -348,45 +352,40 @@ Internet → Cloudflare Tunnel → compute_gateway:8080
                                Ollama:11434
 ```
 
-Process supervision: **systemd** (Linux) or **NSSM** (Windows) to restart on failure. Health checks can ping `/health` from an external monitor (e.g. Uptime Kuma).
-
 ---
 
-## Web Frontend (Vercel)
+## Cloud API (Vercel)
 
 ### Repository layout (target)
 
 ```
 linguacoda_ai/
-├── apps/
-│   └── web/                 # Next.js app (Vercel root)
-│       ├── app/
-│       ├── components/      # Ported UI from renderer.js
-│       └── lib/
-│           ├── auth.ts
-│           ├── vocab.ts
-│           └── compute-client.ts
+├── main.js, renderer.js, ...     # Electron app (primary client)
+├── electron_backend.py
+├── transcription_server.py
 ├── services/
-│   └── compute_gateway/     # Python — remote AI entry point
-├── transcription_server.py  # Unchanged ASR/align service
-├── electron/                # Existing Electron app (optional move)
+│   ├── cloud-api/                # Minimal Next.js — Vercel root
+│   │   ├── app/api/
+│   │   └── auth.ts
+│   └── compute_gateway/          # Python — home PC AI entry point
 └── ARCHITECTURE.md
 ```
 
 ### Environment variables
 
-**Vercel:**
-- `AUTH_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
+**Vercel (cloud API):**
+- `AUTH_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `AUTH_URL`
 - `DATABASE_URL`
-- `COMPUTE_GATEWAY_URL` (server-only)
-- `JWT_SECRET` (shared with home gateway for compute tokens)
+- `JWT_SECRET` (shared with home gateway)
+
+**Electron (`electron-config.json` or env):**
+- `cloudApiBaseUrl` — e.g. `https://api.linguacoda.app`
+- `computeMode` — `local` | `remote`
+- `computeGatewayUrl` — tunnel URL when remote
 
 **Home PC:**
-- `LINGUACODA_REMOTE_MODE=1`
-- `JWT_SECRET` (same as Vercel)
-- `ALLOWED_ORIGINS`
-- `OLLAMA_ENDPOINT`, `OLLAMA_MODEL`
-- `MAX_CONCURRENT_TRANSCRIPTIONS` (e.g. 2–3)
+- `LINGUACODA_REMOTE_MODE=1`, `JWT_SECRET`, `OLLAMA_ENDPOINT`, `OLLAMA_MODEL`
+- `MAX_CONCURRENT_TRANSCRIPTIONS`
 
 ---
 
@@ -394,173 +393,128 @@ linguacoda_ai/
 
 | Concern | Mitigation |
 |---------|------------|
-| Open AI endpoints | JWT on every compute request; no anonymous access in remote mode |
-| Local transcription token leaked | Keep `.transcription_server.token` on loopback only; gateway holds it |
-| DDoS / abuse | Cloudflare Tunnel + gateway rate limits + max body size on audio uploads |
-| CORS | Allow only the Vercel production (and preview) origins |
-| Session hijacking | HTTP-only Secure cookies; short compute token TTL |
-| Data isolation | All vocab queries scoped by `user_id` from session; no client-supplied user IDs |
-| Secrets in repo | `.env` / Vercel env / home PC env only; never commit |
+| Open AI endpoints | JWT on every compute request in remote mode |
+| Local transcription token leaked | `.transcription_server.token` loopback-only on home PC |
+| DDoS / abuse | Cloudflare Tunnel + gateway rate limits + max body size |
+| Electron token storage | `safeStorage` / encrypted file; never log tokens |
+| Data isolation | Vocab scoped by authenticated `user_id` |
+| Secrets in repo | `.env` / Vercel env / home PC env only |
+
+CORS is **not** the primary security boundary for compute — Electron calls from main process are not browser CORS requests. JWT validation is.
 
 ---
 
 ## Concurrency & Rate Limiting
 
-The home PC has finite GPU/CPU. Recommended defaults:
-
 | Limit | Suggested value | Behavior |
 |-------|-----------------|----------|
-| Max concurrent `/transcribe` | 2–3 | Queue or `429 Too Many Requests` |
-| Max concurrent Ollama calls | 1–2 | Serialize translation to protect VRAM |
-| Rate limit per user | 60 req/min | Sliding window at gateway |
-| Rate limit per IP | 120 req/min | Edge or gateway |
-| Max audio payload | 5 MB per chunk | Reject oversize with `413` |
-
-Expose queue depth or estimated wait in `/health` so the UI can set expectations when multiple users are active.
+| Max concurrent `/transcribe` | 2–3 | Queue or `429` |
+| Max concurrent Ollama calls | 1–2 | Serialize |
+| Rate limit per user (JWT sub) | 60 req/min | Gateway sliding window |
+| Max audio payload | 5 MB per chunk | `413` |
 
 ---
 
-## Desktop Client (Electron) — Current & Future
+## Desktop Client (Electron)
 
 ### Current architecture (main branch)
 
-The project is an **Electron desktop app** with:
+- **Main process (`main.js`)**: window, Python backend spawn, IPC, Ollama calls.
+- **Renderer (`renderer.js`)**: UI, pairs, vocab, flashcards.
+- **Python backend (`electron_backend.py`)**: WASAPI capture, transcription client.
+- **Transcription server (`transcription_server.py`)**: ASR + alignment.
 
-- **Electron Main Process (`main.js`)**: window lifecycle, Python backend spawn, IPC handlers, Ollama translation calls.
-- **Electron Renderer (`renderer.js`)**: UI, transcription pairs, vocab tracker, flashcards.
-- **Python Backend (`electron_backend.py`)**: audio capture, buffering, transcription client.
-- **Transcription Server (`transcription_server.py`)**: SenseVoice ASR, SimAlign alignment.
+**IPC is the seam:** renderer → `preload.js` → `ipcMain` → Python backend / transcription server / Ollama.
 
-At runtime:
+### Production extensions
 
-1. Electron starts and creates a window.
-2. Electron starts (or connects to) the transcription server.
-3. Electron starts the Python backend as a child process.
-4. Renderer drives capture over IPC; backend emits transcription JSON on stdout.
-5. Main process translates via Ollama; renderer displays pairs and vocab tracking.
-
-**IPC is the seam:** renderer → `preload.js` → `ipcMain` → Python backend / HTTP to transcription server / Ollama.
-
-### Future Electron integration
-
-- Add sign-in flow (embedded browser or deep link) sharing the same Auth.js app.
-- Replace direct Ollama IPC with compute gateway client when `COMPUTE_GATEWAY_URL` is set.
-- Vocab: load/sync via `/api/vocab` instead of only `localStorage`.
-- Keep loopback audio capture as the differentiator over the web client.
+| Area | Change |
+|------|--------|
+| Auth | Sign in with Google via system browser + `linguacoda://` callback |
+| Vocab | Cloud sync via `/api/vocab`; `localStorage` as offline draft |
+| Compute | `local` mode unchanged; `remote` mode routes AI through gateway |
+| WASAPI | **No change** — remains the reason Electron is the client |
 
 ---
 
 ## AI Components
 
-Three distinct AI subsystems (unchanged in technology choice):
+| Subsystem | Local mode | Remote mode |
+|-----------|------------|-------------|
+| **ASR (SenseVoice)** | Python backend → local transcription server | Electron/backend → gateway → transcription server |
+| **Alignment (SimAlign)** | main.js → local `/align` | main.js → gateway `/align` |
+| **LLM (Ollama)** | main.js → local Ollama | main.js → gateway → Ollama |
 
-| Subsystem | Runtime (today) | Runtime (production) |
-|-----------|-----------------|----------------------|
-| **ASR (SenseVoice)** | `transcription_server.py` | Home PC transcription server |
-| **Alignment (SimAlign + pkuseg)** | `transcription_server.py` `/align` | Home PC transcription server |
-| **LLM (Ollama)** | Electron `main.js` | Home compute gateway → Ollama |
-
-### ASR: SenseVoice
-
-- Model: `SENSEVOICE_MODEL` in `config.py` (default `iic/SenseVoiceSmall`).
-- Client sends base64 float32 audio; receives `{ transcription, detectedLang }`.
-
-### LLM: Translation & learning features
-
-- Ollama `POST /api/generate` with `ollamaModel` from config.
-- Used for: translation, vocab context, flashcard entries.
-- Prompts remain as implemented in `main.js` today; gateway rehosts them.
-
-### Semantic alignment (detail view)
-
-- `POST /align` with `{ transcription, translation }`.
-- Pipeline: strip parentheticals → pkuseg / whitespace tokenization → SimAlign (XLM-R, IterMax).
-- Returns `{ transcriptionChunks, translationChunks, correlations }`.
+Prompts and model config stay as in `main.js` and `electron-config.json`; gateway rehosts them in remote mode.
 
 ---
 
 ## Data Flows
 
-### Web: Audio → Transcription → Translation
+### Electron local mode (unchanged)
 
-```mermaid
-sequenceDiagram
-    participant B as Browser
-    participant G as Home Gateway
-    participant T as Transcription Server
-    participant O as Ollama
+1. Renderer → `startCapture` IPC → Python backend (WASAPI).
+2. Backend → `POST /transcribe` on local transcription server.
+3. Backend stdout → main → renderer event.
+4. Renderer → `translateText` IPC → Ollama.
+5. `trackVocabFromText` → memory + local draft → cloud sync on close.
 
-    B->>B: getUserMedia mic capture
-    B->>G: WS connect + JWT
-    loop Audio chunks
-        B->>G: audio chunk
-        G->>T: POST /transcribe
-        T->>G: text + detectedLang
-        G->>B: transcription event
-        B->>G: POST /translate
-        G->>O: generate
-        O->>G: translation
-        G->>B: translation
-        B->>B: trackVocabFromText
-    end
-    B->>B: Vercel PUT /api/vocab on close
-```
+### Electron remote mode
 
-### Desktop: Audio → Transcription (current)
+1. Renderer → `startCapture` IPC → Python backend (WASAPI) — **capture stays local on client machine**.
+2. Backend (or main) → `POST https://gateway/transcribe` with compute JWT + audio payload.
+3. Gateway → home transcription server → result back to Electron.
+4. Renderer → `translateText` IPC → main → gateway `/translate`.
+5. Vocab sync → Vercel `/api/vocab` (unchanged).
 
-1. Renderer → `startCapture` IPC → Python backend stdin.
-2. Backend buffers audio → `TranscriptionClient` → `POST /transcribe`.
-3. Backend stdout JSON → main process → renderer event.
-4. Renderer splits sentences → `translateText` IPC → Ollama.
-5. `trackVocabFromText` → `localStorage` (future: also cloud sync).
+**Important:** In remote mode, **audio is captured on the user's machine** (WASAPI) and **sent to the home server for ASR**. The Python backend may stay on the client for capture only, posting to the remote gateway instead of localhost.
 
-### Vocab sync (production)
+### Vocab sync
 
-1. Login → fetch `user_vocab.seen_vocab`.
-2. Session mutations in memory.
-3. Triggers: `pagehide`, `visibilitychange(hidden)`, 5-min debounce → `PUT /api/vocab`.
+1. Login → `GET /api/vocab`.
+2. Session mutations in renderer memory.
+3. Triggers: app close, 5-min debounce → `PUT /api/vocab`.
 
 ---
 
 ## Configuration & Persistence
 
-| Setting | Desktop (today) | Web (target) | Remote gateway |
-|---------|-------------------|--------------|----------------|
-| Ollama endpoint | `electron-config.json` | N/A (server-side) | env `OLLAMA_ENDPOINT` |
-| Transcription URL | `127.0.0.1:8765` | via gateway URL | loopback |
-| Vocab | `localStorage.seenVocab` | PostgreSQL | N/A |
-| Auth | N/A | Auth.js + Google | JWT validation |
-| Device cache | `device_cache.json` | N/A | N/A |
+| Setting | Electron local | Electron remote | Cloud API | Home gateway |
+|---------|----------------|-----------------|-----------|--------------|
+| Capture | WASAPI via Python backend | WASAPI via Python backend | N/A | N/A |
+| Transcription | `127.0.0.1:8765` | `computeGatewayUrl` | N/A | loopback |
+| Ollama | `electron-config.json` | via gateway | N/A | loopback |
+| Vocab | cloud + localStorage draft | cloud + localStorage draft | PostgreSQL | N/A |
+| Auth | safeStorage token | safeStorage token | Auth.js | JWT validation |
 
 ---
 
 ## Migration Phases
 
-### Phase 1 — Auth + vocab cloud (no remote compute)
+### Phase 1 — Cloud API + Electron auth & vocab sync
 
-- Next.js on Vercel with Google login.
+- Minimal Next.js API on Vercel (auth + vocab only).
 - PostgreSQL `user_vocab` table.
-- Port vocab tracker UI; batch sync on close.
-- Transcription/translation disabled or mocked in web UI.
+- Electron: Google sign-in, cloud vocab sync, batch on app close.
+- No UI port to web. Transcription unchanged.
 
-### Phase 2 — Compute gateway + tunnel
+### Phase 2 — Compute gateway + remote mode
 
-- Implement `compute_gateway.py` with `--remote` flag.
-- Cloudflare Tunnel to home PC.
-- BFF compute token route on Vercel.
-- Web client: mic capture + live transcription.
+- `services/compute_gateway/` with `--remote` flag.
+- Cloudflare Tunnel on home PC.
+- `POST /api/compute/token` on Vercel.
+- Electron: `computeMode: remote` routes AI through gateway.
 
-### Phase 3 — Electron parity
+### Phase 3 — Polish & distribution
 
-- Electron uses same auth and vocab API.
-- Optional: Electron talks to local gateway when on same machine.
-- Loopback capture remains Electron-only.
+- Settings UI: account, compute mode, sync status.
+- Installer / auto-update (optional).
+- Offline and gateway-down UX.
 
 ### Phase 4 — Hardening
 
-- Rate limits, monitoring, structured logging.
-- Preview deployment auth restrictions.
-- Load testing for concurrent sessions.
+- Rate limits, logging, monitoring.
+- Load testing with multiple concurrent Electron clients.
 
 ---
 
@@ -568,26 +522,25 @@ sequenceDiagram
 
 | Failure | Response |
 |---------|----------|
-| Home gateway offline | UI banner; vocab still works; queue failed compute retries |
-| Transcription server cold start | `/health` shows `ready: false`; UI loading state (existing behavior) |
-| Aligner not warmed up | `/health.alignerReady`; detail view shows loading (existing behavior) |
-| Ollama timeout | Per-request timeout; show pair with transcription only |
-| Vocab sync conflict | Per-word max merge; log `updated_at` mismatch |
-| Tab killed before sync | `sendBeacon` on `pagehide`; localStorage draft as fallback |
-| Rate limit hit | `429` with `Retry-After`; UI backoff message |
+| Home gateway offline | Electron banner; vocab still works; retry AI calls |
+| Cloud API offline | Vocab uses local draft; show "signed in offline" or prompt re-login |
+| Transcription server cold start | `/health` `ready: false`; existing loading UI |
+| Ollama timeout | Show pair with transcription only |
+| Vocab sync conflict | Per-word max merge |
+| App killed before sync | localStorage draft; merge on next login |
+| Rate limit hit | `429` with backoff message in UI |
 
 ---
 
 ## Extensibility Notes
 
-- **New suite tools**: add routes/views in Next.js app; shared components from renderer port.
-- **New analyses per pair**: add gateway endpoint + client method.
-- **Cache semantic units**: store on `transcriptionPairs[i]` client-side to avoid repeat `/align`.
-- **Multi-user home server**: per-user JWT identity enables fair queuing and audit logs.
-- **Future paid tier**: gate compute token issuance by subscription in Vercel BFF.
+- **New suite tools**: add to `renderer.js` / `index.html` as today.
+- **New AI endpoints**: add to gateway + `main.js` IPC handler.
+- **Multi-device**: same Google account, multiple Electron installs, shared vocab via cloud API.
+- **Future web dashboard** (optional): read-only vocab stats on Vercel — not a substitute for the desktop app.
 
 ---
 
 ## Summary
 
-The production system is a **three-tier architecture**: Vercel hosts the authenticated web experience and vocab persistence; a **home compute gateway** (remote mode) exposes AI capabilities behind JWT auth, rate limits, and preferably a Cloudflare Tunnel; the existing **transcription server** and **Ollama** stay on the home PC as internal services. Google OAuth provides identity; PostgreSQL stores per-user `seenVocab` with batch sync and multi-device merge. The Electron app remains the power-user client for loopback audio while sharing the same account and vocab data.
+The production system is **Electron-first**: the desktop app is the only client, preserving WASAPI loopback and the existing UI/IPC architecture. **Vercel hosts a slim cloud API** for Google OAuth, vocab persistence, and compute token issuance — not the Language Learning Suite UI. A **home compute gateway** (optional remote mode) shares AI workloads across multiple Electron sessions behind JWT auth and a Cloudflare Tunnel. Local mode continues to work for single-machine development and personal use.
