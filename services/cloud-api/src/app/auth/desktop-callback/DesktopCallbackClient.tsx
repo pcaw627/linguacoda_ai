@@ -3,26 +3,24 @@
 import { useEffect } from "react";
 
 type Props = {
-  code: string;
+  handoffUrl: string;
 };
 
-export function DesktopCallbackClient({ code }: Props) {
-  const appUrl = `linguacoda://auth/callback?code=${encodeURIComponent(code)}`;
-
+export function DesktopCallbackClient({ handoffUrl }: Props) {
   useEffect(() => {
-    window.location.href = appUrl;
-  }, [appUrl]);
+    window.location.replace(handoffUrl);
+  }, [handoffUrl]);
 
   return (
     <main className="page">
       <h1>Signed in</h1>
-      <p className="message">Return to the LinguaCoda desktop app</p>
+      <p className="message">Returning to LinguaCoda…</p>
       <p className="hint">
-        Your browser may ask to open LinguaCoda. If nothing happens, click the
-        button below.
+        The desktop app should receive your sign-in automatically. If the app
+        does not update, click below.
       </p>
       <p className="download">
-        <a href={appUrl}>Open LinguaCoda</a>
+        <a href={handoffUrl}>Continue to LinguaCoda</a>
       </p>
     </main>
   );

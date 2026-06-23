@@ -1,10 +1,15 @@
 const { app, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const http = require('http');
 const axios = require('axios');
 
 const authTokenFile = () => path.join(app.getPath('userData'), 'api-token.enc');
 const authMetaFile = () => path.join(app.getPath('userData'), 'auth-meta.json');
+
+const OAUTH_LOOPBACK_TIMEOUT_MS = 5 * 60 * 1000;
+let activeOAuthServer = null;
+let activeOAuthTimeout = null;
 
 function isEncryptionAvailable() {
   try {
@@ -69,6 +74,86 @@ function getCloudApiBaseUrl(config) {
   const base = config?.cloudApiBaseUrl;
   if (!base || typeof base !== 'string') return null;
   return base.replace(/\/$/, '');
+}
+
+function stopOAuthLoopbackServer() {
+  if (activeOAuthTimeout) {
+    clearTimeout(activeOAuthTimeout);
+    activeOAuthTimeout = null;
+  }
+  if (activeOAuthServer) {
+    activeOAuthServer.close();
+    activeOAuthServer = null;
+  }
+}
+
+function startOAuthLoopbackServer() {
+  stopOAuthLoopbackServer();
+
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      try {
+        const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+        if (requestUrl.pathname !== '/auth/callback') {
+          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Not found');
+          return;
+        }
+
+        const code = requestUrl.searchParams.get('code');
+        if (!code) {
+          res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Missing code');
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(
+          '<!DOCTYPE html><html><body style="font-family:system-ui;padding:2rem">' +
+          '<h1>Signed in to LinguaCoda</h1>' +
+          '<p>You can close this tab and return to the desktop app.</p>' +
+          '</body></html>'
+        );
+
+        if (server.oauthResolve) {
+          server.oauthResolve(code);
+        }
+        stopOAuthLoopbackServer();
+      } catch {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Error');
+      }
+    });
+
+    server.on('error', (err) => {
+      stopOAuthLoopbackServer();
+      reject(err);
+    });
+
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : null;
+      if (!port) {
+        stopOAuthLoopbackServer();
+        reject(new Error('Could not start local OAuth server'));
+        return;
+      }
+
+      const loopbackUrl = `http://127.0.0.1:${port}/auth/callback`;
+      activeOAuthServer = server;
+
+      const waitForCode = new Promise((resolveCode, rejectCode) => {
+        server.oauthResolve = resolveCode;
+        activeOAuthTimeout = setTimeout(() => {
+          stopOAuthLoopbackServer();
+          rejectCode(new Error('Sign-in timed out after 5 minutes'));
+        }, OAUTH_LOOPBACK_TIMEOUT_MS);
+      });
+
+      console.log(`[CloudAuth] Listening for OAuth callback on ${loopbackUrl}`);
+      resolve({ loopbackUrl, waitForCode });
+    });
+  });
 }
 
 async function cloudApiFetch(config, apiPath, options = {}) {
@@ -140,10 +225,13 @@ async function pingCloudHealth(config) {
   }
 }
 
-function buildSignInUrl(config) {
+function buildSignInUrl(config, loopbackUrl) {
   const baseUrl = getCloudApiBaseUrl(config);
-  if (!baseUrl) return null;
-  const callbackUrl = encodeURIComponent('/auth/desktop-callback');
+  if (!baseUrl || !loopbackUrl) return null;
+
+  const desktopCallback =
+    `/auth/desktop-callback?redirect=${encodeURIComponent(loopbackUrl)}`;
+  const callbackUrl = encodeURIComponent(desktopCallback);
   return `${baseUrl}/api/auth/signin/google?callbackUrl=${callbackUrl}`;
 }
 
@@ -157,4 +245,6 @@ module.exports = {
   exchangeDesktopCode,
   pingCloudHealth,
   buildSignInUrl,
+  startOAuthLoopbackServer,
+  stopOAuthLoopbackServer,
 };
