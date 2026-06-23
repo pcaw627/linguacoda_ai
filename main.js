@@ -78,10 +78,23 @@ async function handleProtocolCallback(url) {
     const result = await cloudApi.exchangeDesktopCode(config, code);
     cloudApi.saveApiToken(result.token, result.email);
 
-    mainWindow.webContents.send('auth-state-changed', { signedIn: true, email: result.email });
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('auth-state-changed', {
+        signedIn: true,
+        email: result.email,
+      });
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
     console.log('[CloudAuth] Signed in via Google');
   } catch (err) {
     console.error('[CloudAuth] Protocol callback failed:', err.message);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('auth-state-changed', {
+        signedIn: false,
+        error: err.message,
+      });
+    }
   }
 }
 
