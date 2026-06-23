@@ -143,7 +143,7 @@ async function pingCloudHealth(config) {
 function buildSignInUrl(config) {
   const baseUrl = getCloudApiBaseUrl(config);
   if (!baseUrl) return null;
-  const callbackUrl = encodeURIComponent(`${baseUrl}/auth/desktop-callback`);
+  const callbackUrl = encodeURIComponent('/auth/desktop-callback');
   return `${baseUrl}/api/auth/signin/google?callbackUrl=${callbackUrl}`;
 }
 

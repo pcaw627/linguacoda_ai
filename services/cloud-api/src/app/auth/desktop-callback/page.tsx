@@ -1,6 +1,7 @@
 import { auth } from "@/auth";
 import { createDesktopAuthCode } from "@/lib/desktop-auth";
 import { redirect } from "next/navigation";
+import { DesktopCallbackClient } from "./DesktopCallbackClient";
 
 export default async function DesktopCallbackPage() {
   const session = await auth();
@@ -10,5 +11,8 @@ export default async function DesktopCallbackPage() {
   }
 
   const code = await createDesktopAuthCode(session.user.id);
-  redirect(`linguacoda://auth/callback?code=${encodeURIComponent(code)}`);
+
+  // Do not use redirect("linguacoda://...") — browsers block custom-scheme
+  // server redirects from HTTPS pages. Hand off via client-side navigation.
+  return <DesktopCallbackClient code={code} />;
 }

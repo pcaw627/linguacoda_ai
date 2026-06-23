@@ -133,13 +133,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             refreshVocabUI: () => initializeVocabTracker(),
         });
         window.VocabSync.setupAccountUI();
-
-        if (window.electronAPI.onAuthStateChanged) {
-            window.electronAPI.onAuthStateChanged(async () => {
-                await window.VocabSync.pullAndMergeOnLogin();
-                window.VocabSync.updateAccountStatusUI();
-            });
-        }
     }
     
     // Register the global transcription-result dispatcher up front so it is

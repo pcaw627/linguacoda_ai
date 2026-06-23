@@ -197,6 +197,7 @@ function initVocabSync(hooks) {
 function setupAccountUI() {
   const signInBtn = document.getElementById('account-sign-in-btn');
   const signOutBtn = document.getElementById('account-sign-out-btn');
+  const statusEl = document.getElementById('account-sync-status');
 
   if (signInBtn) {
     signInBtn.addEventListener('click', async () => {
@@ -205,13 +206,25 @@ function setupAccountUI() {
         const result = await window.electronAPI.signIn();
         if (!result?.success) {
           console.warn('[Account] Sign in failed:', result?.error);
-        } else {
-          await pullAndMergeOnLogin();
+        } else if (statusEl) {
+          statusEl.textContent =
+            'Complete sign-in in your browser, then allow Open LinguaCoda';
         }
       } finally {
         signInBtn.disabled = false;
-        updateAccountStatusUI();
       }
+    });
+  }
+
+  if (window.electronAPI.onAuthStateChanged) {
+    window.electronAPI.onAuthStateChanged(async (data) => {
+      if (data?.error) {
+        syncState.lastSyncError = data.error;
+      }
+      if (data?.signedIn) {
+        await pullAndMergeOnLogin();
+      }
+      updateAccountStatusUI();
     });
   }
 
