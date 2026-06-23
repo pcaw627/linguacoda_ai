@@ -30,8 +30,9 @@ export default async function DesktopCallbackPage({ searchParams }: Props) {
   const session = await auth();
 
   if (!session?.user?.id) {
-    const callbackPath = `/auth/desktop-callback?redirect=${encodeURIComponent(redirectTarget)}`;
-    redirect(`/api/auth/signin?callbackUrl=${encodeURIComponent(callbackPath)}`);
+    redirect(
+      `/auth/desktop-signin?redirect=${encodeURIComponent(redirectTarget)}`
+    );
   }
 
   const code = await createDesktopAuthCode(session.user.id);

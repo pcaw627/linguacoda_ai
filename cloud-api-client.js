@@ -229,10 +229,7 @@ function buildSignInUrl(config, loopbackUrl) {
   const baseUrl = getCloudApiBaseUrl(config);
   if (!baseUrl || !loopbackUrl) return null;
 
-  const desktopCallback =
-    `/auth/desktop-callback?redirect=${encodeURIComponent(loopbackUrl)}`;
-  const callbackUrl = encodeURIComponent(desktopCallback);
-  return `${baseUrl}/api/auth/signin/google?callbackUrl=${callbackUrl}`;
+  return `${baseUrl}/auth/desktop-signin?redirect=${encodeURIComponent(loopbackUrl)}`;
 }
 
 module.exports = {
