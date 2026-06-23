@@ -6,5 +6,5 @@
   "transcriptionLanguage": "auto",
   "maxTextLength": 1000,
   "updateIntervalMs": 100,
-  "cloudApiBaseUrl": "http://localhost:3000"
+  "cloudApiBaseUrl": "https://linguacoda-ai.vercel.app"
 }
