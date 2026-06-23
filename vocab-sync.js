@@ -208,7 +208,7 @@ function setupAccountUI() {
           console.warn('[Account] Sign in failed:', result?.error);
         } else if (statusEl) {
           statusEl.textContent =
-            'Complete sign-in in your browser, then allow Open LinguaCoda';
+            'Complete sign-in in your browser; you can close the tab when done';
         }
       } finally {
         signInBtn.disabled = false;
