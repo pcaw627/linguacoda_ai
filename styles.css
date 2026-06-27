@@ -882,6 +882,42 @@ body {
     min-width: 200px;
 }
 
+.compute-status {
+    font-size: 0.8rem;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid #3d3d3d;
+    background: #252525;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.compute-status-ready {
+    border-color: #2d6a4f;
+    color: #95d5b2;
+}
+
+.compute-status-warming {
+    border-color: #8a6d1d;
+    color: #ffd166;
+}
+
+.compute-status-offline {
+    border-color: #7a2e2e;
+    color: #f4a3a3;
+}
+
+.compute-offline-banner {
+    width: 100%;
+    margin: 8px 0 0;
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: rgba(122, 46, 46, 0.25);
+    border: 1px solid #7a2e2e;
+    color: #f4c4c4;
+    font-size: 0.85rem;
+}
+
 .account-actions {
     display: flex;
     gap: 8px;

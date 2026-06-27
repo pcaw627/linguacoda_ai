@@ -9,6 +9,7 @@ funasr>=1.0.0
 
 # Ollama API
 requests>=2.31.0
+PyJWT>=2.8.0
 
 # Cross-lingual semantic-unit alignment
 #   simalign   — multilingual word alignment (XLM-R + IterMax matching)

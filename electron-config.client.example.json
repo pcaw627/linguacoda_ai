@@ -7,6 +7,6 @@
   "maxTextLength": 1000,
   "updateIntervalMs": 100,
   "cloudApiBaseUrl": "https://linguacoda-ai.vercel.app",
-  "computeMode": "local",
-  "computeGatewayUrl": ""
+  "computeMode": "remote",
+  "computeGatewayUrl": "http://192.168.1.100:8080"
 }

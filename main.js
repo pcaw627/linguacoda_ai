@@ -5,6 +5,7 @@ const { spawn } = require('child_process');
 const axios = require('axios');
 const { pinyin } = require('pinyin-pro');
 const cloudApi = require('./cloud-api-client');
+const computeClient = require('./compute-client');
 
 // Zoom level persistence
 const zoomFile = path.join(__dirname, '.zoom-level');
@@ -31,6 +32,47 @@ const config = require('./electron-config.json');
 let allowAppClose = false;
 let lastCloudHealth = null;
 let pendingOAuthFlow = null;
+let computeJwtRefreshTimer = null;
+
+const computeJwtFile = () => path.join(app.getPath('userData'), 'compute-jwt.txt');
+
+function writeComputeJwtFile(token) {
+  try {
+    fs.writeFileSync(computeJwtFile(), token, 'utf8');
+  } catch (err) {
+    console.warn('[Compute] Failed to write JWT file:', err.message);
+  }
+}
+
+function clearComputeJwtFile() {
+  try {
+    if (fs.existsSync(computeJwtFile())) fs.unlinkSync(computeJwtFile());
+  } catch (err) {
+    console.warn('[Compute] Failed to clear JWT file:', err.message);
+  }
+}
+
+async function refreshComputeJwt() {
+  if (!computeClient.isRemoteCompute(config)) return;
+  if (!cloudApi.loadApiToken()) return;
+  try {
+    await computeClient.getComputeToken(config);
+  } catch (err) {
+    console.warn('[Compute] JWT refresh failed:', err.message);
+  }
+}
+
+function startComputeJwtRefresh() {
+  if (computeJwtRefreshTimer) {
+    clearInterval(computeJwtRefreshTimer);
+    computeJwtRefreshTimer = null;
+  }
+  if (!computeClient.isRemoteCompute(config)) return;
+  refreshComputeJwt();
+  computeJwtRefreshTimer = setInterval(refreshComputeJwt, 10 * 60 * 1000);
+}
+
+computeClient.setOnJwtRefreshed(writeComputeJwtFile);
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -317,12 +359,23 @@ async function startTranscriptionServer() {
   return true;
 }
 
-// Start Python backend
+// Start Python backend (audio capture only on client; transcribe URL from env in remote mode)
+function getPythonBackendEnv() {
+  const env = { ...process.env };
+  if (computeClient.isRemoteCompute(config)) {
+    env.LINGUACODA_COMPUTE_GATEWAY_URL = computeClient.getGatewayUrl(config);
+    env.LINGUACODA_COMPUTE_JWT_FILE = computeJwtFile();
+    console.log(`[AudioBackend] Remote compute gateway: ${env.LINGUACODA_COMPUTE_GATEWAY_URL}`);
+  }
+  return env;
+}
+
 function startPythonBackend() {
   const pythonScript = path.join(__dirname, 'electron_backend.py');
   pythonBackend = spawn('python', [pythonScript], {
     cwd: __dirname,
-    stdio: ['pipe', 'pipe', 'pipe']
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: getPythonBackendEnv(),
   });
 
   pythonBackend.stdout.on('data', (data) => {
@@ -386,6 +439,27 @@ ipcMain.handle('get-config', () => {
 });
 
 ipcMain.handle('start-capture', async (event, deviceId, deviceType) => {
+  if (computeClient.isRemoteCompute(config)) {
+    if (!cloudApi.loadApiToken()) {
+      return { success: false, error: 'Sign in required for remote compute' };
+    }
+    const health = await computeClient.health(config);
+    if (!health.success) {
+      return {
+        success: false,
+        error: health.error || 'Compute server offline — check gateway URL and server stack',
+      };
+    }
+    if (!health.ready) {
+      return { success: false, error: 'Compute server is warming up — try again shortly' };
+    }
+    try {
+      await computeClient.getComputeToken(config);
+    } catch (err) {
+      return { success: false, error: err.message || 'Failed to get compute token' };
+    }
+  }
+
   if (pythonBackend && pythonBackend.stdin.writable) {
     pythonBackend.stdin.write(JSON.stringify({ action: 'start', deviceId, deviceType }) + '\n');
     return { success: true };
@@ -460,6 +534,16 @@ function cleanPinyin(str) {
 }
 
 ipcMain.handle('translate-text', async (event, text) => {
+  if (computeClient.isRemoteCompute(config)) {
+    try {
+      return await computeClient.translate(config, text);
+    } catch (error) {
+      const message = computeClient.formatGatewayError(error, config);
+      console.error(`Translation error: ${message}`);
+      return { success: false, error: message };
+    }
+  }
+
   try {
     const response = await axios.post(`${config.ollamaEndpoint}/api/generate`, {
       model: config.ollamaModel,
@@ -511,6 +595,17 @@ function formatAlignError(error) {
 }
 
 ipcMain.handle('extract-semantic-units', async (event, transcription, translation) => {
+  if (computeClient.isRemoteCompute(config)) {
+    try {
+      console.log('[SemanticUnits] Aligning via remote compute gateway…');
+      return await computeClient.align(config, transcription, translation);
+    } catch (error) {
+      const message = computeClient.formatGatewayError(error, config);
+      console.error('Semantic unit alignment error:', message);
+      return { success: false, error: message };
+    }
+  }
+
   try {
     const token = loadTranscriptionServerToken();
     if (!token) {
@@ -561,20 +656,70 @@ ipcMain.handle('extract-semantic-units', async (event, transcription, translatio
 // Report transcription service readiness so the renderer can show a
 // "Loading..." badge until the SenseVoice model has finished initializing
 // (i.e. until the server logs "Transcription service ready").
-ipcMain.handle('get-transcription-status', async () => {
+async function getComputeStatusSnapshot() {
+  const mode = config.computeMode === 'remote' ? 'remote' : 'local';
+  const remote = computeClient.isRemoteCompute(config);
+  const signedIn = !!cloudApi.loadApiToken();
+
+  if (remote) {
+    const status = await computeClient.health(config);
+    let state = 'offline';
+    if (status.success) {
+      state = status.ready ? 'ready' : 'warming';
+    }
+    if (!signedIn) {
+      state = 'auth-required';
+    }
+    return {
+      mode: 'remote',
+      state,
+      success: status.success,
+      ready: signedIn && status.success && status.ready,
+      alignerReady: status.alignerReady,
+      ollamaOk: status.ollamaOk,
+      signedIn,
+      error: status.error,
+      gatewayConfigured: !!computeClient.getGatewayUrl(config),
+    };
+  }
+
   try {
     const response = await axios.get('http://127.0.0.1:8765/health', { timeout: 1500 });
     if (response.status === 200 && response.data) {
+      const ready = !!response.data.ready;
       return {
+        mode: 'local',
+        state: ready ? 'ready' : 'warming',
         success: true,
-        ready: !!response.data.ready,
-        alignerReady: !!response.data.alignerReady
+        ready,
+        alignerReady: !!response.data.alignerReady,
+        signedIn,
       };
     }
-    return { success: false, ready: false };
+    return { mode: 'local', state: 'offline', success: false, ready: false, signedIn };
   } catch (error) {
-    return { success: false, ready: false };
+    return {
+      mode: 'local',
+      state: 'offline',
+      success: false,
+      ready: false,
+      signedIn,
+      error: error.message,
+    };
   }
+}
+
+ipcMain.handle('get-compute-status', async () => getComputeStatusSnapshot());
+
+ipcMain.handle('get-transcription-status', async () => {
+  const status = await getComputeStatusSnapshot();
+  return {
+    success: status.success,
+    ready: status.ready,
+    alignerReady: status.alignerReady,
+    remote: status.mode === 'remote',
+    error: status.error,
+  };
 });
 
 // Load HSK dictionary from local JSON file
@@ -651,6 +796,15 @@ ipcMain.handle('get-pinyin-info', async (event, text) => {
 
 // Generate vocab context via Ollama
 ipcMain.handle('generate-vocab-context', async (event, word) => {
+  if (computeClient.isRemoteCompute(config)) {
+    try {
+      return await computeClient.vocabContext(config, word);
+    } catch (error) {
+      console.error('Vocab context generation error:', error.message);
+      return { success: false, error: computeClient.formatGatewayError(error, config) };
+    }
+  }
+
   try {
     const response = await axios.post(`${config.ollamaEndpoint}/api/generate`, {
       model: config.ollamaModel,
@@ -677,17 +831,23 @@ ipcMain.handle('get-flashcard-entry', async (event, word) => {
       return { success: false, error: 'invalid word' };
     }
 
-    const prompt = `You are a Chinese-English dictionary. For the Chinese word "${word}", list every distinct pronunciation together with its meaning. Respond with ONLY a single JSON object and nothing else: no greeting, no explanation, no markdown, no text before or after it. Use exactly this shape: {"entries":[{"pinyin":"pin yin with tone marks","meaning":"very brief English definition"}]}. Each meaning must be at most 5 words. Include one array item per distinct pronunciation/meaning.`;
+    let raw;
+    if (computeClient.isRemoteCompute(config)) {
+      const remote = await computeClient.flashcardEntry(config, word);
+      if (!remote.success) return remote;
+      raw = remote.raw;
+    } else {
+      const prompt = `You are a Chinese-English dictionary. For the Chinese word "${word}", list every distinct pronunciation together with its meaning. Respond with ONLY a single JSON object and nothing else: no greeting, no explanation, no markdown, no text before or after it. Use exactly this shape: {"entries":[{"pinyin":"pin yin with tone marks","meaning":"very brief English definition"}]}. Each meaning must be at most 5 words. Include one array item per distinct pronunciation/meaning.`;
 
-    const response = await axios.post(`${config.ollamaEndpoint}/api/generate`, {
-      model: config.ollamaModel,
-      prompt,
-      stream: false,
-      format: 'json'
-    });
-
-    const raw = response.data && response.data.response;
-    if (!raw) return { success: false, error: 'No response received' };
+      const response = await axios.post(`${config.ollamaEndpoint}/api/generate`, {
+        model: config.ollamaModel,
+        prompt,
+        stream: false,
+        format: 'json'
+      });
+      raw = response.data && response.data.response;
+      if (!raw) return { success: false, error: 'No response received' };
+    }
 
     const parsed = extractJsonObject(raw);
     if (!parsed) return { success: false, error: 'Could not parse JSON from model output' };
@@ -780,6 +940,8 @@ ipcMain.handle('window-close', () => {
 async function completeOAuthSignIn(code) {
   const result = await cloudApi.exchangeDesktopCode(config, code);
   cloudApi.saveApiToken(result.token, result.email);
+  await refreshComputeJwt();
+  startComputeJwtRefresh();
 
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('auth-state-changed', {
@@ -839,6 +1001,12 @@ ipcMain.handle('sign-out', async () => {
   cloudApi.stopOAuthLoopbackServer();
   pendingOAuthFlow = null;
   cloudApi.clearAuth();
+  computeClient.clearComputeTokenCache();
+  clearComputeJwtFile();
+  if (computeJwtRefreshTimer) {
+    clearInterval(computeJwtRefreshTimer);
+    computeJwtRefreshTimer = null;
+  }
   return { success: true };
 });
 
@@ -980,32 +1148,37 @@ app.whenReady().then(async () => {
   // device enumeration isn't blocked behind the server's health check.
   startPythonBackend();
 
-  // Bring up the transcription server in parallel. The server binds its HTTP
-  // port immediately and loads the SenseVoice model + pkuseg/SimAlign aligner
-  // on background threads, so /health responds well before the models finish.
-  (async () => {
-    const serverRunning = await checkTranscriptionServer();
-    if (!serverRunning) {
-      console.log('[TranscriptionServer] Server not running, starting it...');
-      await startTranscriptionServer();
-      // Wait a moment for server to start and verify it's running
-      let attempts = 0;
-      while (attempts < 10) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        const isRunning = await checkTranscriptionServer();
-        if (isRunning) {
-          console.log('[TranscriptionServer] Server started successfully');
-          break;
+  if (computeClient.isRemoteCompute(config)) {
+    console.log(`[Compute] Remote mode — gateway ${computeClient.getGatewayUrl(config)}`);
+    console.log('[Compute] Skipping local transcription server (models run on server machine)');
+    startComputeJwtRefresh();
+  } else {
+    // Bring up the transcription server in parallel. The server binds its HTTP
+    // port immediately and loads the SenseVoice model + pkuseg/SimAlign aligner
+    // on background threads, so /health responds well before the models finish.
+    (async () => {
+      const serverRunning = await checkTranscriptionServer();
+      if (!serverRunning) {
+        console.log('[TranscriptionServer] Server not running, starting it...');
+        await startTranscriptionServer();
+        let attempts = 0;
+        while (attempts < 10) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          const isRunning = await checkTranscriptionServer();
+          if (isRunning) {
+            console.log('[TranscriptionServer] Server started successfully');
+            break;
+          }
+          attempts++;
         }
-        attempts++;
+        if (attempts >= 10) {
+          console.warn('[TranscriptionServer] Server may not have started properly, but continuing...');
+        }
+      } else {
+        console.log('[TranscriptionServer] Server already running, connecting to existing instance...');
       }
-      if (attempts >= 10) {
-        console.warn('[TranscriptionServer] Server may not have started properly, but continuing...');
-      }
-    } else {
-      console.log('[TranscriptionServer] Server already running, connecting to existing instance...');
-    }
-  })();
+    })();
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

@@ -6,7 +6,9 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "dev:api": "npm run dev --prefix services/cloud-api"
+    "dev:api": "npm run dev --prefix services/cloud-api",
+    "start:compute-server": "powershell -ExecutionPolicy Bypass -File scripts/start_compute_server.ps1",
+    "start:compute-stack": "powershell -ExecutionPolicy Bypass -File scripts/start_compute_stack.ps1"
   },
   "keywords": [
     "electron",
