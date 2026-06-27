@@ -20,6 +20,8 @@ let transcriptionViewInitialized = false; // one-time listener/UI setup guard
 // Transcription service readiness (server has loaded the SenseVoice model)
 let transcriptionReady = false;
 let transcriptionReadyPollTimer = null;
+let computeStatusPollTimer = null;
+let lastComputeStatus = null;
 
 // Vocab tracker state
 let seenVocab = JSON.parse(localStorage.getItem('seenVocab') || '{}'); // { word: count }
@@ -178,6 +180,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // so a round is "loaded in the chamber" before the user enters Flashcards.
     preloadNextFlashcardRound();
 
+    startComputeStatusPolling();
+
     // Back button for the tone matching view
     document.getElementById('tone-back-btn').addEventListener('click', async () => {
         await toneStopListening();
@@ -240,7 +244,29 @@ function startTranscriptionReadyPolling() {
 async function pollTranscriptionReady() {
     let ready = false;
     try {
-        const status = await window.electronAPI.getTranscriptionStatus();
+        const status = await window.electronAPI.getComputeStatus();
+        lastComputeStatus = status;
+        updateComputeStatusUI(status);
+
+        if (status.mode === 'remote') {
+            if (!status.signedIn) {
+                transcriptionReady = false;
+                if (!isCapturing) updateStatus('Sign in for remote AI', 'loading');
+                updateToneReadinessUI();
+                updateUI();
+                transcriptionReadyPollTimer = setTimeout(pollTranscriptionReady, 2000);
+                return;
+            }
+            if (status.state === 'offline') {
+                transcriptionReady = false;
+                if (!isCapturing) updateStatus('Compute offline', 'loading');
+                updateToneReadinessUI();
+                updateUI();
+                transcriptionReadyPollTimer = setTimeout(pollTranscriptionReady, 2000);
+                return;
+            }
+        }
+
         ready = !!(status && status.ready);
     } catch (err) {
         ready = false;
@@ -259,6 +285,75 @@ async function pollTranscriptionReady() {
     if (!isCapturing) updateStatus('Loading...', 'loading');
     updateToneReadinessUI();
     transcriptionReadyPollTimer = setTimeout(pollTranscriptionReady, 1000);
+}
+
+function formatComputeStatusLabel(status) {
+    if (!status) return 'Compute: checking…';
+    const mode = status.mode === 'remote' ? 'remote' : 'local';
+    let stateLabel = 'checking';
+    switch (status.state) {
+        case 'ready':
+            stateLabel = 'ready';
+            break;
+        case 'warming':
+            stateLabel = 'warming up';
+            break;
+        case 'auth-required':
+            stateLabel = 'sign in required';
+            break;
+        case 'offline':
+        default:
+            stateLabel = status.state === 'offline' ? 'offline' : 'checking';
+            break;
+    }
+    return `Compute: ${mode} · ${stateLabel}`;
+}
+
+function updateComputeStatusUI(status) {
+    const chip = document.getElementById('compute-status');
+    if (chip) {
+        chip.textContent = formatComputeStatusLabel(status);
+        chip.className = 'compute-status';
+        if (status?.state === 'ready') chip.classList.add('compute-status-ready');
+        else if (status?.state === 'warming' || status?.state === 'auth-required') {
+            chip.classList.add('compute-status-warming');
+        } else chip.classList.add('compute-status-offline');
+        chip.title = status?.error
+            ? `AI compute: ${status.error}`
+            : formatComputeStatusLabel(status);
+    }
+
+    const banner = document.getElementById('compute-offline-banner');
+    if (banner) {
+        if (status?.mode === 'remote' && (status.state === 'offline' || status.state === 'auth-required')) {
+            banner.style.display = 'block';
+            banner.textContent = status.state === 'auth-required'
+                ? 'Remote AI requires Google sign-in. Vocab sync and flashcards still work locally.'
+                : 'Compute server is offline. Start capture is disabled until the gateway is reachable.';
+        } else {
+            banner.style.display = 'none';
+            banner.textContent = '';
+        }
+    }
+}
+
+function startComputeStatusPolling() {
+    if (computeStatusPollTimer) {
+        clearTimeout(computeStatusPollTimer);
+        computeStatusPollTimer = null;
+    }
+    pollComputeStatusChip();
+}
+
+async function pollComputeStatusChip() {
+    try {
+        const status = await window.electronAPI.getComputeStatus();
+        lastComputeStatus = status;
+        updateComputeStatusUI(status);
+    } catch (err) {
+        updateComputeStatusUI({ mode: 'local', state: 'offline', error: err.message });
+    }
+    computeStatusPollTimer = setTimeout(pollComputeStatusChip, 5000);
 }
 
 // Reflect transcription-service readiness on the Tone Matching view: keep the
@@ -1016,8 +1111,11 @@ function recalculatePairHeights(pairWrappers) {
 
 // Update UI state
 function updateUI() {
+    const computeBlocksCapture = lastComputeStatus
+        && lastComputeStatus.mode === 'remote'
+        && (lastComputeStatus.state === 'offline' || lastComputeStatus.state === 'auth-required');
     // Can't start capturing until the transcription service has finished loading.
-    document.getElementById('start-btn').disabled = isCapturing || !transcriptionReady;
+    document.getElementById('start-btn').disabled = isCapturing || !transcriptionReady || computeBlocksCapture;
     document.getElementById('stop-btn').disabled = !isCapturing;
     document.getElementById('device-select').disabled = isCapturing;
     document.getElementById('language-select').disabled = isCapturing;

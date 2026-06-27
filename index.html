@@ -57,6 +57,7 @@
             <div class="account-bar" id="account-bar">
                 <span class="account-email" id="account-email">Checking account…</span>
                 <span class="account-sync-status" id="account-sync-status"></span>
+                <span class="compute-status" id="compute-status" title="AI compute server status">Compute: checking…</span>
                 <div class="account-actions">
                     <button id="account-sign-in-btn" class="account-btn" type="button">Sign in with Google</button>
                     <button id="account-sign-out-btn" class="account-btn account-btn-secondary" type="button" style="display: none;">Sign out</button>
@@ -163,6 +164,8 @@
                         <span id="threshold-value" class="threshold-value">0.0001</span>
                     </div>
                 </div>
+
+                <div id="compute-offline-banner" class="compute-offline-banner" style="display: none;"></div>
 
                 <div class="button-group">
                     <button id="start-btn" class="btn btn-primary">

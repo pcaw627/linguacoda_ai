@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setBufferDuration: (duration) => ipcRenderer.invoke('set-buffer-duration', duration),
   getHskDictionary: () => ipcRenderer.invoke('get-hsk-dictionary'),
   getTranscriptionStatus: () => ipcRenderer.invoke('get-transcription-status'),
+  getComputeStatus: () => ipcRenderer.invoke('get-compute-status'),
   getPinyin: (text) => ipcRenderer.invoke('get-pinyin', text),
   getPinyinBatch: (words) => ipcRenderer.invoke('get-pinyin-batch', words),
   getPinyinInfo: (text) => ipcRenderer.invoke('get-pinyin-info', text),

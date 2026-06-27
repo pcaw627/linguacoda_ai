@@ -14,7 +14,9 @@ A desktop application that helps you learn foreign languages by:
 | `services/cloud-api/` | Vercel-deployed cloud API (Google auth, vocab sync, compute tokens) — API routes only, not the product UI |
 | `services/compute_gateway/` | Home PC AI gateway for shared transcription/LLM workloads (Phase 2) |
 
-Run the desktop app from the repo root (`npm start`). Run the cloud API locally with `npm run dev:api` or `cd services/cloud-api && npm run dev`.
+Run the desktop app from the repo root (`npm start`). Run the cloud API locally with `npm run dev:api` (port **3000**, auth/vocab dev only).
+
+**Server + laptop split:** see [CLIENT_SERVER.md](./CLIENT_SERVER.md) — server runs `npm run start:compute-server`, laptop uses `computeMode: "remote"` in `electron-config.json`.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full production design and [MIGRATION_PROMPTS.md](./MIGRATION_PROMPTS.md) for the implementation plan.
 
